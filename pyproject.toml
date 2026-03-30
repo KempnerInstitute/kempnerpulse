@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kempnerpulse"
+version = "0.1.0"
+description = "Real-time GPU monitoring dashboard for DCGM Prometheus metrics"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.9"
+authors = [
+    {name = "Kempner Institute, Harvard University"},
+]
+keywords = ["gpu", "monitoring", "dcgm", "nvidia", "dashboard", "hpc"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "rich>=13.0",
+]
+
+[project.scripts]
+kempnerpulse = "kempner_pulse:main"
+
+[project.urls]
+Homepage = "https://github.com/KempnerInstitute/kempnerpulse"
+Issues = "https://github.com/KempnerInstitute/kempnerpulse/issues"
