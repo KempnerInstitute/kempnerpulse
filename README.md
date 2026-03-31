@@ -10,7 +10,7 @@ renders four interactive views in the terminal.
 - **Fleet View** : All GPUs at a glance: utilization, memory, power,
   temperature, PCIe/NVLink bandwidth, sparkline bars.
 - **Focus View** : Deep dive into one GPU with per-metric sparkline history.
-- **Plot View** : nvtop-style stacked line charts across all GPUs.
+- **Plot View** : Stacked line charts across all GPUs.
 - **Job View** : Running GPU compute processes with per-GPU metrics.
 - **Real Utilization** : Weighted composite metric from SM active, tensor pipe,
   DRAM active, and GR engine counters (customizable weights with presets for
@@ -40,7 +40,7 @@ Deep dive into a single GPU with per-metric sparkline history.
 
 ### Plot View
 
-nvtop-style stacked line charts across all GPUs.
+Stacked line charts across all GPUs.
 
 ![Plot View](docs/images/plot_view.png)
 
@@ -100,7 +100,7 @@ kempnerpulse --weights 0.40,0.30,0.20,0.10
 | Command       | Action                                      |
 |---------------|---------------------------------------------|
 | `:focus <id>` | Enter focused view for a specific GPU       |
-| `:plot`       | Enter plot view (nvtop-style line charts)   |
+| `:plot`       | Enter plot view (line charts)   |
 | `:job`        | Enter job view (running GPU processes)      |
 | `:q`          | Return to fleet view (or exit if in fleet)  |
 | `:exit`       | Exit the dashboard                          |

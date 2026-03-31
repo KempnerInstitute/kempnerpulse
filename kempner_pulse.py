@@ -75,7 +75,7 @@ _RE_LABEL = re.compile(r'(\w+)="((?:\\.|[^"\\])*)"')
 
 GPU_COLORS = ["bold green", "bold cyan", "bold yellow", "bold magenta", "bold red", "bold blue", "bold white"]
 
-# ── Box-drawing characters and colors for nvtop-style line charts ─────────────
+# ── Box-drawing characters and colors for line charts ─────────────
 _CH_HLINE = '─'
 _CH_VLINE = '│'
 _CH_ULCORNER = '┌'
@@ -1298,7 +1298,7 @@ def gpu_card(state: DerivedGPUState, history: HistoryStore, power_limit: Optiona
     return Panel(body, box=box.ROUNDED, border_style=border)
 
 
-# ── nvtop-style line chart renderer ──────────────────────────────────────────
+# ── Line chart renderer ──────────────────────────────────────────
 
 def _data_level(rows: int, value: float) -> int:
     """Convert a 0-100 percentage to a screen row (0 = top = 100%, rows-1 = bottom = 0%)."""
@@ -1315,7 +1315,7 @@ def _render_line_chart(
     vmax: float = 100.0,
 ) -> List[List[Tuple[str, int]]]:
     """
-    Render an nvtop-style line chart into a 2D character grid.
+    Render a line chart into a 2D character grid.
 
     gpu_data:   [(gpu_id, [values ...]), ...]  one entry per GPU line.
     chart_rows: height of the chart area in rows.
@@ -1386,7 +1386,7 @@ def _render_line_chart(
 
 
 class LinePlotRenderable:
-    """Rich renderable that draws an nvtop-style line chart, adapting to available width."""
+    """Rich renderable that draws a line chart, adapting to available width."""
 
     def __init__(
         self,
@@ -1488,7 +1488,7 @@ def line_plot_view_panel(
     power_limits: Optional[Dict[str, float]] = None,
     console_height: int = 50,
 ) -> Panel:
-    """Build the full Plot View: shared legend + 3×3 grid of nvtop-style line charts."""
+    """Build the full Plot View: shared legend + 3×3 grid of line charts."""
     gpu_ids = sorted({s.gpu_id for s in states}, key=lambda x: int(x) if x.isdigit() else x)
 
     # Dynamic chart_rows based on terminal height.
@@ -1960,7 +1960,7 @@ GPU visibility selection:
 Interactive commands:
   :focus 0     Enter focused view for GPU 0
   :focus 1     Enter focused view for GPU 1
-  :plot        Enter plot view (nvtop-style line charts)
+  :plot        Enter plot view (line charts)
   :job         Enter job view (running GPU processes)
   :q           In any sub-view: return to fleet view
                In fleet view: exit the dashboard
