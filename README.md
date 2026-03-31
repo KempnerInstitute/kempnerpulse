@@ -209,6 +209,10 @@ temperature, power, clocks, PCIe, NVLink, and error counters. The complete
 list with descriptions and NVIDIA doc links:
 [docs/metrics.md](docs/metrics.md)
 
+## Performance Overhead
+
+KempnerPulse introduces minimal runtime overhead, using approximately 8.2% of a single CPU core on an AMD EPYC 9374F processor, with negligible memory usage (below the reporting resolution of `top`).
+
 ## License
 
 MIT. See [LICENSE](LICENSE) for details.
