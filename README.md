@@ -18,8 +18,8 @@ renders four interactive views in the terminal.
 - **Workload Classification** : 12-category status based on NVIDIA DCGM
   profiling metric guidance (idle, tensor-heavy compute, memory-bound, I/O,
   etc.).
-- **Health Monitoring** : Temperature, PCIe replay errors, ECC errors, XID
-  errors with color-coded alerts.
+- **Health Monitoring** : Temperature, PCIe replay errors, and ECC errors
+  with color-coded alerts.
 - **SLURM/CUDA Aware** : Automatically detects `CUDA_VISIBLE_DEVICES`,
   `SLURM_JOB_GPUS`, etc. to show only your allocated GPUs.
 - **Zero Dependencies** beyond Python 3.9+ and `rich`.
@@ -204,7 +204,7 @@ RTX 6000: 92 °C, default: 93 °C). Full threshold table:
 
 ## DCGM Metrics
 
-KempnerPulse consumes ~35 DCGM fields covering profiling counters, memory,
+KempnerPulse consumes ~30 DCGM fields covering profiling counters, memory,
 temperature, power, clocks, PCIe, NVLink, and error counters. The complete
 list with descriptions and NVIDIA doc links:
 [docs/metrics.md](docs/metrics.md)

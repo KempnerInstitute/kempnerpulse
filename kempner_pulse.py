@@ -17,7 +17,6 @@ import os
 import pwd
 import re
 import socket
-import sys
 import time
 import subprocess
 import urllib.request
@@ -843,7 +842,7 @@ def derive_real_util(values: Dict[str, float], weights: Tuple[float, float, floa
 
     real_util = w_sm * sm_active + w_tensor * tensor + w_dram * dram + w_gr * gr_active
     real_util = max(0.0, min(100.0, real_util))
-    io_heavy = memcpy >= 40 or max(pcie_rx, pcie_tx) >= 1 * 1024**3
+    io_heavy = memcpy >= 40 or max(pcie_rx, pcie_tx) >= 1e9
 
     # 1. Idle — nothing running
     if real_util < 5 and gr_active < 5 and dram < 5 and not io_heavy:
