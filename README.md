@@ -60,11 +60,13 @@ Running GPU compute processes with per-GPU metrics.
 
 ## Installation
 
+Install locally (recommended until published on PyPI):
+
 ```bash
-pip install kempnerpulse
+pip install .
 ```
 
-Or run directly:
+Or run directly (installs only the rich dependency):
 
 ```bash
 pip install rich
