@@ -64,6 +64,10 @@ Running GPU compute processes with per-GPU metrics.
 - Python >= 3.9
 - `nvidia-smi` on the PATH (for hardware queries and process listing)
 
+> **Note:** KempnerPulse currently supports NVIDIA datacenter GPUs (V100, A100, H100, H200, B200, B300).
+> Grace-Hopper (GH200), Grace-Blackwell (GB200) and RTX support is planned but not yet tested.
+> AMD GPUs are not supported.
+
 ## Installation
 
 ```bash
