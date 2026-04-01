@@ -2066,7 +2066,7 @@ def main() -> int:
         update_history(history, cached_states)
         prev = sample
         current_visible_ids = {s.gpu_id for s in cached_states}
-        cached_gpu_procs = query_gpu_processes()
+        cached_gpu_procs = query_gpu_processes() if controller.jobs_mode else {}
         if controller.focus_gpu is not None and controller.focus_gpu not in current_visible_ids and current_visible_ids:
             controller.focus_gpu = sorted(current_visible_ids, key=lambda x: int(x) if x.isdigit() else x)[0]
             controller.last_message = f"Focused GPU unavailable; switched to GPU {controller.focus_gpu}"
