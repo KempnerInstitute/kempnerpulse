@@ -72,8 +72,6 @@ _RE_METRIC_LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\{([^}]*)\}\s+([-+]?\d
 _RE_BARE_LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\s+([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)$')
 _RE_LABEL = re.compile(r'(\w+)="((?:\\.|[^"\\])*)"')
 
-GPU_COLORS = ["bold green", "bold cyan", "bold yellow", "bold magenta", "bold red", "bold blue", "bold white"]
-
 # ── Box-drawing characters and colors for line charts ─────────────
 _CH_HLINE = '─'
 _CH_VLINE = '│'
@@ -135,7 +133,6 @@ class DerivedGPUState:
     health_style: str = "green"
     status_line: str = "idle"
     real_util: float = 0.0
-    bottleneck: str = "idle"
     memory_total_mib: Optional[float] = None
     memory_used_pct: Optional[float] = None
     energy_j: Optional[float] = None
@@ -999,7 +996,7 @@ def build_gpu_states(sample: Sample, prev: Optional[Sample], weights: Tuple[floa
                     rates[metric] = r
 
         health, health_style = health_from_metrics(values, rates, identity.get("modelName"))
-        real_util, status_key, status_line = derive_real_util(values, weights)
+        real_util, _, status_line = derive_real_util(values, weights)
 
         fb_used = values.get("DCGM_FI_DEV_FB_USED")
         fb_free = values.get("DCGM_FI_DEV_FB_FREE")
@@ -1023,7 +1020,6 @@ def build_gpu_states(sample: Sample, prev: Optional[Sample], weights: Tuple[floa
             health_style=health_style,
             status_line=status_line,
             real_util=real_util,
-            bottleneck=status_key,
             memory_total_mib=memory_total,
             memory_used_pct=memory_used_pct,
             energy_j=energy_j,
