@@ -492,19 +492,8 @@ def query_gpu_models() -> Dict[str, str]:
         return {}
 
 
-def query_gpu_processes() -> Dict[str, List[GpuProcess]]:
-    """Query running GPU compute processes via nvidia-smi.
-
-    Uses two nvidia-smi calls:
-      1. --query-gpu to build a PCI-bus-id -> GPU-index mapping.
-      2. --query-compute-apps to list processes.  (instant, no sampling delay)
-
-    For each PID, user/group are resolved from /proc and the full command line
-    is read from /proc/<pid>/cmdline.
-
-    Returns {gpu_index_str: [GpuProcess, ...]}.
-    """
-    # 1. Bus-ID -> GPU-index mapping
+def query_bus_id_mapping() -> Dict[str, str]:
+    """Query nvidia-smi for PCI bus-id to GPU index mapping (static hardware info)."""
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=index,pci.bus_id", "--format=csv,noheader"],
@@ -514,13 +503,28 @@ def query_gpu_processes() -> Dict[str, List[GpuProcess]]:
             return {}
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return {}
-    bus_to_idx: Dict[str, str] = {}
+    mapping: Dict[str, str] = {}
     for line in r.stdout.strip().splitlines():
         parts = [p.strip() for p in line.split(",")]
         if len(parts) == 2:
-            bus_to_idx[parts[1].upper()] = parts[0]
+            mapping[parts[1].upper()] = parts[0]
+    return mapping
 
-    # 2. Compute processes
+
+def query_gpu_processes(bus_to_idx: Dict[str, str]) -> Dict[str, List[GpuProcess]]:
+    """Query running GPU compute processes via nvidia-smi.
+
+    Uses --query-compute-apps to list processes (instant, no sampling delay).
+    Requires a pre-built bus_to_idx mapping from query_bus_id_mapping().
+
+    For each PID, user/group are resolved from /proc and the full command line
+    is read from /proc/<pid>/cmdline.
+
+    Returns {gpu_index_str: [GpuProcess, ...]}.
+    """
+    if not bus_to_idx:
+        return {}
+    # Compute processes
     try:
         r2 = subprocess.run(
             ["nvidia-smi",
@@ -1120,11 +1124,16 @@ def query_system_cpu() -> Tuple[Optional[int], Optional[int], Optional[float], O
         if aggregate_total == 0:
             return None, None, None, None
         num_threads = os.cpu_count() or len(per_core)
-        try:
-            result = subprocess.run(["nproc", "--all"], capture_output=True, text=True, timeout=2)
-            num_cores = int(result.stdout.strip()) if result.returncode == 0 else num_threads
-        except (OSError, ValueError, subprocess.TimeoutExpired):
-            num_cores = num_threads
+        cached = getattr(query_system_cpu, "_nproc_cache", None)
+        if cached is not None:
+            num_cores = cached
+        else:
+            try:
+                result = subprocess.run(["nproc", "--all"], capture_output=True, text=True, timeout=2)
+                num_cores = int(result.stdout.strip()) if result.returncode == 0 else num_threads
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                num_cores = num_threads
+            query_system_cpu._nproc_cache = num_cores
         prev = getattr(query_system_cpu, "_prev", None)
         query_system_cpu._prev = (aggregate_idle, aggregate_total, per_core)
         if prev is None:
@@ -1170,7 +1179,11 @@ def query_system_ram() -> Tuple[Optional[float], Optional[float]]:
 
 # ── Summary panel ────────────────────────────────────────────────────────────
 
-def summary_panel(states: List[DerivedGPUState], source: str, poll: float, selection_desc: str) -> Panel:
+def summary_panel(
+    states: List[DerivedGPUState], source: str, poll: float, selection_desc: str,
+    cpu_info: Tuple[Optional[int], Optional[int], Optional[float], Optional[int]] = (None, None, None, None),
+    ram_info: Tuple[Optional[float], Optional[float]] = (None, None),
+) -> Panel:
     n = len(states)
     avg_real = sum(s.real_util for s in states) / n if n else 0.0
     avg_power = sum((s.values.get("DCGM_FI_DEV_POWER_USAGE") or 0.0) for s in states) / n if n else 0.0
@@ -1180,8 +1193,8 @@ def summary_panel(states: List[DerivedGPUState], source: str, poll: float, selec
     mem_pct = 100.0 * total_fb_used / total_fb if total_fb > 0 else 0.0
     active = sum(1 for s in states if s.real_util >= 20 or (s.memory_used_pct or 0) >= 20)
     critical = sum(1 for s in states if s.health != "OK")
-    cpu_threads, cpu_cores, cpu_pct, cpu_busy = query_system_cpu()
-    ram_used_gb, ram_total_gb = query_system_ram()
+    cpu_threads, cpu_cores, cpu_pct, cpu_busy = cpu_info
+    ram_used_gb, ram_total_gb = ram_info
 
     # Format CPU text: " 32 / 64 (50.0%)" - fixed width
     if cpu_cores is not None and cpu_busy is not None and cpu_pct is not None:
@@ -1834,6 +1847,8 @@ def render_dashboard(
     console_height: int = 50,
     weights: Tuple[float, float, float, float] = (0.35, 0.35, 0.20, 0.10),
     gpu_processes: Optional[Dict[str, List[GpuProcess]]] = None,
+    cpu_info: Tuple[Optional[int], Optional[int], Optional[float], Optional[int]] = (None, None, None, None),
+    ram_info: Tuple[Optional[float], Optional[float]] = (None, None),
 ) -> Layout:
     layout = Layout()
     layout.split_column(
@@ -1841,7 +1856,7 @@ def render_dashboard(
         Layout(name="middle", ratio=1),
         Layout(name="footer", size=3),
     )
-    layout["summary"].update(summary_panel(states, source, poll, selection_desc))
+    layout["summary"].update(summary_panel(states, source, poll, selection_desc, cpu_info=cpu_info, ram_info=ram_info))
     layout["footer"].update(footer_panel(selection_desc, controller, source, poll, weights))
 
     if not states:
@@ -2051,13 +2066,17 @@ def main() -> int:
     gpu_models = query_gpu_models()
     pcie_bw_limits, pcie_info = query_pcie_bandwidth()
     nvlink_bw_limits = query_nvlink_bandwidth()
+    bus_id_map = query_bus_id_mapping()
 
     current_visible_ids: Set[str] = set()
     cached_states: List[DerivedGPUState] = []
     cached_gpu_procs: Dict[str, List[GpuProcess]] = {}
+    cached_cpu_info: Tuple[Optional[int], Optional[int], Optional[float], Optional[int]] = (None, None, None, None)
+    cached_ram_info: Tuple[Optional[float], Optional[float]] = (None, None)
 
     def fetch_data() -> None:
         nonlocal prev, current_visible_ids, cached_states, cached_gpu_procs
+        nonlocal cached_cpu_info, cached_ram_info
         raw = load_source(args.source)
         sample = parse_prometheus_text(raw)
         filtered_sample = filter_sample_to_gpu_ids(sample, allowed_gpu_ids)
@@ -2066,7 +2085,9 @@ def main() -> int:
         update_history(history, cached_states)
         prev = sample
         current_visible_ids = {s.gpu_id for s in cached_states}
-        cached_gpu_procs = query_gpu_processes() if controller.jobs_mode else {}
+        cached_gpu_procs = query_gpu_processes(bus_id_map) if controller.jobs_mode else {}
+        cached_cpu_info = query_system_cpu()
+        cached_ram_info = query_system_ram()
         if controller.focus_gpu is not None and controller.focus_gpu not in current_visible_ids and current_visible_ids:
             controller.focus_gpu = sorted(current_visible_ids, key=lambda x: int(x) if x.isdigit() else x)[0]
             controller.last_message = f"Focused GPU unavailable; switched to GPU {controller.focus_gpu}"
@@ -2086,6 +2107,8 @@ def main() -> int:
             console_height=console.height,
             weights=args.weights,
             gpu_processes=cached_gpu_procs,
+            cpu_info=cached_cpu_info,
+            ram_info=cached_ram_info,
         )
 
     fetch_data()
