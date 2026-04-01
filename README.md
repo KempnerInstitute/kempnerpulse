@@ -7,6 +7,8 @@ Rich-based TUI that streams
 [dcgm-exporter](https://github.com/NVIDIA/dcgm-exporter) `/metrics` and
 renders four interactive views in the terminal.
 
+![KempnerPulse Demo](docs/images/kempner_pulse_screen_record.gif)
+
 ## Features
 
 - **Fleet View** : All GPUs at a glance: utilization, memory, power,
