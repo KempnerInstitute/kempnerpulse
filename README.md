@@ -1,5 +1,7 @@
 # KempnerPulse
 
+[![PyPI](https://img.shields.io/pypi/v/kempnerpulse)](https://pypi.org/project/kempnerpulse/)
+
 > `nvidia-smi` says 100% GPU utilization - but are your tensor cores even active? KempnerPulse shows what's *actually* happening.
 
 Real-time GPU monitoring dashboard for DCGM Prometheus metrics. A single-file
@@ -64,17 +66,14 @@ Running GPU compute processes with per-GPU metrics.
 
 ## Installation
 
-Install locally (recommended until published on PyPI):
+```bash
+pip install kempnerpulse
+```
+
+Or install from source:
 
 ```bash
 pip install .
-```
-
-Or run directly (installs only the rich dependency):
-
-```bash
-pip install rich
-python3 kempner_pulse.py
 ```
 
 ## Quick Start
