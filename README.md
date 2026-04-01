@@ -135,7 +135,9 @@ The dashboard picks the first available source in this order:
 5. `SLURM_JOB_GPUS` env var
 
 If none are set, all GPUs on the node are shown. Use `--show-all` to
-explicitly override all env vars.
+explicitly override all env vars. All GPU selections are filtered against
+GPUs accessible to the current process (as reported by `nvidia-smi`),
+which respects cgroup and container restrictions.
 
 ## Weight Presets
 

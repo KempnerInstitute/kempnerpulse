@@ -156,24 +156,56 @@ class HistoryStore:
         return gpu_data.get(metric, deque(maxlen=self.maxlen))
 
 
+def query_accessible_gpus() -> Optional[Set[str]]:
+    """Query nvidia-smi for GPU indices accessible to the current user.
+
+    nvidia-smi respects cgroup restrictions, so it only returns GPUs the
+    user's process can actually access.  Returns None if nvidia-smi is
+    unavailable (fall back to no filtering).
+    """
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return None
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+    ids: Set[str] = set()
+    for line in r.stdout.strip().splitlines():
+        token = line.strip()
+        if token.isdigit():
+            ids.add(token)
+    return ids if ids else None
+
+
 class GPUSelector:
-    def __init__(self, explicit: Optional[str], disable_auto: bool = False):
+    def __init__(self, explicit: Optional[str], disable_auto: bool = False,
+                 accessible: Optional[Set[str]] = None):
         self.explicit = explicit
         self.disable_auto = disable_auto
+        self.accessible = accessible
         self.allowed: Optional[Set[str]] = None
         self.reason: str = "all"
         self.source_value: Optional[str] = None
 
+    def _clamp(self, ids: Optional[Set[str]]) -> Optional[Set[str]]:
+        """Intersect ids with the accessible set."""
+        if ids is None or self.accessible is None:
+            return ids
+        return ids & self.accessible
+
     def resolve(self) -> Tuple[Optional[Set[str]], str, Optional[str]]:
         if self.explicit:
-            ids = self._parse_gpu_list(self.explicit)
+            ids = self._clamp(self._parse_gpu_list(self.explicit))
             self.allowed = ids
             self.reason = "--gpus"
             self.source_value = self.explicit
             return self.allowed, self.reason, self.source_value
 
         if self.disable_auto:
-            self.allowed = None
+            self.allowed = self._clamp(self.accessible)
             self.reason = "all"
             self.source_value = None
             return self.allowed, self.reason, self.source_value
@@ -188,14 +220,14 @@ class GPUSelector:
             raw = os.environ.get(key, "").strip()
             if not raw:
                 continue
-            ids = self._parse_gpu_list(raw)
+            ids = self._clamp(self._parse_gpu_list(raw))
             if ids:
                 self.allowed = ids
                 self.reason = key
                 self.source_value = raw
                 return self.allowed, self.reason, self.source_value
 
-        self.allowed = None
+        self.allowed = self._clamp(self.accessible)
         self.reason = "all"
         self.source_value = None
         return self.allowed, self.reason, self.source_value
@@ -1955,6 +1987,8 @@ GPU visibility selection:
     5. SLURM_JOB_GPUS
   If none are usable, all GPUs on the node are shown. Use --show-all to ignore
   the environment and show every GPU, or --gpus to force an explicit list.
+  All selections are filtered against GPUs accessible to the current process
+  (as reported by nvidia-smi), respecting cgroup and container restrictions.
 
 Interactive commands:
   :focus 0     Enter focused view for GPU 0
@@ -2008,7 +2042,11 @@ def main() -> int:
     prev: Optional[Sample] = None
     controller = CommandController(args.focus_gpu)
 
-    selector = GPUSelector(explicit=args.gpus, disable_auto=args.show_all)
+    accessible_gpus = query_accessible_gpus()
+    if not accessible_gpus:
+        console.print("[bold red]KempnerPulse requires a node with NVIDIA GPUs.[/]")
+        return 1
+    selector = GPUSelector(explicit=args.gpus, disable_auto=args.show_all, accessible=accessible_gpus)
     allowed_gpu_ids, selection_reason, selection_value = selector.resolve()
     selection_desc = "all" if allowed_gpu_ids is None else ",".join(sorted(allowed_gpu_ids, key=lambda x: int(x) if x.isdigit() else x)) or "none"
     power_limits = query_power_limits()
