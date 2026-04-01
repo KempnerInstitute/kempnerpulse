@@ -91,6 +91,19 @@ The bottleneck key is used for color-coding in the dashboard:
 | `memory` | magenta | GPU is memory-bandwidth-bound. |
 | `mixed` | yellow | No single dominant workload pattern. |
 
+### Metric Profiles
+
+Each workload category has a distinctive metric signature across the six axes:
+SM Active, Tensor Active, DRAM Active, GR Engine Active, Memcpy/IO, and FP64 Active.
+
+**Overlay** shows how all 12 categories compare on a single chart:
+
+![Classification radar overlay](images/classification_radar_overlay.svg)
+
+**Individual profiles** for each category:
+
+![Classification radar grid](images/classification_radar_grid.svg)
+
 ---
 
 ## Health States

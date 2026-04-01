@@ -1,6 +1,6 @@
 # KempnerPulse
 
-> `nvidia-smi` says 100% GPU utilization — but are your tensor cores even active? KempnerPulse shows what's *actually* happening.
+> `nvidia-smi` says 100% GPU utilization - but are your tensor cores even active? KempnerPulse shows what's *actually* happening.
 
 Real-time GPU monitoring dashboard for DCGM Prometheus metrics. A single-file
 Rich-based TUI that streams
