@@ -1795,8 +1795,8 @@ def workflow_label(weights: Tuple[float, float, float, float]) -> str:
     return WEIGHT_PRESETS.get(rounded, "Custom Workflow")
 
 
-def footer_panel(selection_reason: str, selection_value: Optional[str], controller: CommandController, source: str = "", poll: float = 1.0, weights: Tuple[float, float, float, float] = (0.35, 0.35, 0.20, 0.10)) -> Panel:
-    selection_text = selection_reason if selection_reason == "all" else f"{selection_reason}={selection_value}"
+def footer_panel(selection_desc: str, controller: CommandController, source: str = "", poll: float = 1.0, weights: Tuple[float, float, float, float] = (0.35, 0.35, 0.20, 0.10)) -> Panel:
+    selection_text = selection_desc
     msg = controller.last_message or controller.hint()
     now_str = time.strftime("%Y-%m-%d %H:%M:%S")  # fixed 19 chars
     hostname = socket.gethostname().split('.')[0]
@@ -1827,8 +1827,6 @@ def render_dashboard(
     poll: float,
     controller: CommandController,
     selection_desc: str,
-    selection_reason: str,
-    selection_value: Optional[str],
     power_limits: Optional[Dict[str, float]] = None,
     pcie_bw_limits: Optional[Dict[str, float]] = None,
     pcie_info: str = "",
@@ -1844,7 +1842,7 @@ def render_dashboard(
         Layout(name="footer", size=3),
     )
     layout["summary"].update(summary_panel(states, source, poll, selection_desc))
-    layout["footer"].update(footer_panel(selection_reason, selection_value, controller, source, poll, weights))
+    layout["footer"].update(footer_panel(selection_desc, controller, source, poll, weights))
 
     if not states:
         layout["middle"].update(Panel(
@@ -2047,7 +2045,7 @@ def main() -> int:
         console.print("[bold red]KempnerPulse requires a node with NVIDIA GPUs.[/]")
         return 1
     selector = GPUSelector(explicit=args.gpus, disable_auto=args.show_all, accessible=accessible_gpus)
-    allowed_gpu_ids, selection_reason, selection_value = selector.resolve()
+    allowed_gpu_ids, _, _ = selector.resolve()
     selection_desc = "all" if allowed_gpu_ids is None else ",".join(sorted(allowed_gpu_ids, key=lambda x: int(x) if x.isdigit() else x)) or "none"
     power_limits = query_power_limits()
     gpu_models = query_gpu_models()
@@ -2081,8 +2079,6 @@ def main() -> int:
             args.poll,
             controller,
             selection_desc,
-            selection_reason,
-            selection_value,
             power_limits,
             pcie_bw_limits,
             pcie_info,
