@@ -9,7 +9,7 @@ Rich-based TUI that streams
 [dcgm-exporter](https://github.com/NVIDIA/dcgm-exporter) `/metrics` and
 renders four interactive views in the terminal.
 
-![KempnerPulse Demo](docs/images/kempner_pulse_screen_record.gif)
+![KempnerPulse Demo](https://raw.githubusercontent.com/KempnerInstitute/kempnerpulse/main/docs/images/kempner_pulse_screen_record.gif)
 
 ## Features
 
@@ -36,25 +36,25 @@ renders four interactive views in the terminal.
 
 All GPUs at a glance with utilization bars, memory, power, temperature, and bandwidth.
 
-![Fleet View](docs/images/fleet_view.png)
+![Fleet View](https://raw.githubusercontent.com/KempnerInstitute/kempnerpulse/main/docs/images/fleet_view.png)
 
 ### Focus View
 
 Deep dive into a single GPU with per-metric sparkline history.
 
-![Focus View](docs/images/focus_view.png)
+![Focus View](https://raw.githubusercontent.com/KempnerInstitute/kempnerpulse/main/docs/images/focus_view.png)
 
 ### Plot View
 
 Stacked line charts across all GPUs.
 
-![Plot View](docs/images/plot_view.png)
+![Plot View](https://raw.githubusercontent.com/KempnerInstitute/kempnerpulse/main/docs/images/plot_view.png)
 
 ### Job View
 
 Running GPU compute processes with per-GPU metrics.
 
-![Job View](docs/images/job_view.png)
+![Job View](https://raw.githubusercontent.com/KempnerInstitute/kempnerpulse/main/docs/images/job_view.png)
 
 ## Requirements
 
@@ -100,6 +100,18 @@ kempnerpulse --hpc-weights
 
 # Custom weights (SM, Tensor, DRAM, GR; normalized automatically)
 kempnerpulse --weights 0.40,0.30,0.20,0.10
+
+# Export CSV (default columns) — only GPUs with your processes
+kempnerpulse --export > metrics.csv
+
+# Export all columns
+kempnerpulse --export all > metrics.csv
+
+# Export custom columns
+kempnerpulse --export gpu_id,real_util_pct,power_w,tensor_active_pct > metrics.csv
+
+# Single snapshot export
+kempnerpulse --export --once
 ```
 
 ## Interactive Commands
@@ -130,6 +142,7 @@ kempnerpulse --weights 0.40,0.30,0.20,0.10
 | `--ai-weights` | preset | | AI/LLM training preset `(0.35, 0.35, 0.20, 0.10)`. This is the default. |
 | `--hpc-weights` | preset | | HPC / mixed CUDA preset `(0.45, 0.15, 0.25, 0.15)`. |
 | `--mem-weights` | preset | | Memory-bound / bandwidth-heavy preset `(0.35, 0.10, 0.40, 0.15)`. |
+| `--export` | string | *(off)* | Output CSV to stdout. `--export` for default columns, `--export all` for every column, or `--export col1,col2,...` for a custom set. Only GPUs with processes owned by the current user are included. |
 
 ### GPU Visibility Selection
 
@@ -210,6 +223,24 @@ Full details, bottleneck color key, and NVIDIA reference points:
 Temperature warning thresholds are per-model (A100: 93 °C, H100/H200: 95 °C,
 RTX 6000: 92 °C, default: 93 °C). Full threshold table:
 [docs/classification.md](docs/classification.md#temperature-thresholds-by-gpu-model)
+
+## CSV Export
+
+Export GPU metrics as CSV for offline analysis or terminal monitoring. Only GPUs
+where the current user has running compute processes are included.
+
+```bash
+kempnerpulse --export > metrics.csv            # default columns
+kempnerpulse --export all > metrics.csv        # all 34 columns
+kempnerpulse --export gpu_id,real_util_pct,power_w > metrics.csv  # custom
+kempnerpulse --export --once                   # single snapshot
+```
+
+Default columns: `timestamp, gpu_id, model, gpu_util_pct, mem_used_mib,
+real_util_pct, sm_active_pct, tensor_active_pct, dram_active_pct`
+
+Full column reference and usage details:
+[docs/export.md](docs/export.md)
 
 ## DCGM Metrics
 

@@ -67,7 +67,7 @@ NVLINK_TOTAL_METRIC = "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL"
 
 SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 APP_NAME = "KempnerPulse GPU Dashboard"
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 EXPORT_DEFAULT_COLUMNS = (
     "timestamp", "gpu_id", "model", "gpu_util_pct", "mem_used_mib",
