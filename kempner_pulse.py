@@ -11,6 +11,7 @@ if sys.version_info < (3, 9):
     sys.exit("KempnerPulse requires Python 3.9 or later.")
 
 import argparse
+import csv
 import grp
 import math
 import os
@@ -67,6 +68,52 @@ NVLINK_TOTAL_METRIC = "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL"
 SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 APP_NAME = "KempnerPulse GPU Dashboard"
 __version__ = "0.1.0"
+
+EXPORT_DEFAULT_COLUMNS = (
+    "timestamp", "gpu_id", "model", "gpu_util_pct", "mem_used_mib",
+    "real_util_pct", "sm_active_pct", "tensor_active_pct", "dram_active_pct",
+)
+
+EXPORT_CSV_COLUMNS: Tuple[Tuple[str, str], ...] = (
+    # Tier A: identity + key derived
+    ("timestamp", "_timestamp"),
+    ("gpu_id", "_gpu_id"),
+    ("model", "_model"),
+    ("real_util_pct", "_real_util"),
+    ("status", "_status"),
+    ("health", "_health"),
+    # Tier B: core profiling (Real Util components)
+    ("sm_active_pct", "DCGM_FI_PROF_SM_ACTIVE"),
+    ("tensor_active_pct", "DCGM_FI_PROF_PIPE_TENSOR_ACTIVE"),
+    ("dram_active_pct", "DCGM_FI_PROF_DRAM_ACTIVE"),
+    ("gr_engine_active_pct", "DCGM_FI_PROF_GR_ENGINE_ACTIVE"),
+    ("gpu_util_pct", "DCGM_FI_DEV_GPU_UTIL"),
+    # Tier C: memory/power/thermal
+    ("mem_used_mib", "DCGM_FI_DEV_FB_USED"),
+    ("mem_total_mib", "_mem_total_mib"),
+    ("mem_used_pct", "_mem_used_pct"),
+    ("power_w", "DCGM_FI_DEV_POWER_USAGE"),
+    ("gpu_temp_c", "DCGM_FI_DEV_GPU_TEMP"),
+    ("mem_temp_c", "DCGM_FI_DEV_MEMORY_TEMP"),
+    # Tier D: detailed/secondary
+    ("sm_occupancy_pct", "DCGM_FI_PROF_SM_OCCUPANCY"),
+    ("fp16_pipe_pct", "DCGM_FI_PROF_PIPE_FP16_ACTIVE"),
+    ("fp32_pipe_pct", "DCGM_FI_PROF_PIPE_FP32_ACTIVE"),
+    ("fp64_pipe_pct", "DCGM_FI_PROF_PIPE_FP64_ACTIVE"),
+    ("memcpy_util_pct", "DCGM_FI_DEV_MEM_COPY_UTIL"),
+    ("pcie_rx_bytes_s", "DCGM_FI_PROF_PCIE_RX_BYTES"),
+    ("pcie_tx_bytes_s", "DCGM_FI_PROF_PCIE_TX_BYTES"),
+    ("nvlink_gbps", "_nvlink_gbps"),
+    ("sm_clock_mhz", "DCGM_FI_DEV_SM_CLOCK"),
+    ("mem_clock_mhz", "DCGM_FI_DEV_MEM_CLOCK"),
+    ("pcie_replay_rate_s", "_pcie_replay_rate"),
+    ("energy_j", "_energy_j"),
+    ("tc_hmma_pct", "DCGM_FI_PROF_PIPE_TENSOR_HMMA_ACTIVE"),
+    ("tc_imma_pct", "DCGM_FI_PROF_PIPE_TENSOR_IMMA_ACTIVE"),
+    ("tc_dfma_pct", "DCGM_FI_PROF_PIPE_TENSOR_DFMA_ACTIVE"),
+    ("tc_dmma_pct", "DCGM_FI_PROF_PIPE_TENSOR_DMMA_ACTIVE"),
+    ("tc_qmma_pct", "DCGM_FI_PROF_PIPE_TENSOR_QMMA_ACTIVE"),
+)
 
 _RE_METRIC_LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\{([^}]*)\}\s+([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)$')
 _RE_BARE_LINE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)\s+([-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)$')
@@ -1091,6 +1138,94 @@ def update_history(history: HistoryStore, states: List[DerivedGPUState]) -> None
                 history.push(s.gpu_id, key, val)
 
 
+# ── CSV export helpers ────────────────────────────────────────────────────────
+
+# Lookup: column name → extraction key
+_EXPORT_COL_MAP: Dict[str, str] = {col: key for col, key in EXPORT_CSV_COLUMNS}
+
+
+def _short_model_name(name: str) -> str:
+    """Shorten GPU model for CSV: 'NVIDIA H100 80GB HBM3' → 'H100'."""
+    s = re.sub(r'^NVIDIA\s+', '', name).strip()
+    m = re.match(r'(RTX)\s*(\d+)', s)
+    if m:
+        return m.group(1) + m.group(2)
+    return s.split()[0].split('-')[0]
+
+
+def resolve_export_columns(spec: str) -> List[Tuple[str, str]]:
+    """Resolve --export value to a list of (col_name, extraction_key) pairs."""
+    all_names = {col for col, _ in EXPORT_CSV_COLUMNS}
+    if spec == "default":
+        names = list(EXPORT_DEFAULT_COLUMNS)
+    elif spec == "all":
+        return list(EXPORT_CSV_COLUMNS)
+    else:
+        names = [c.strip() for c in spec.split(",") if c.strip()]
+    bad = [n for n in names if n not in all_names]
+    if bad:
+        print(f"kempnerpulse: unknown export column(s): {', '.join(bad)}", file=sys.stderr)
+        print(f"Available: {', '.join(col for col, _ in EXPORT_CSV_COLUMNS)}", file=sys.stderr)
+        sys.exit(1)
+    return [(n, _EXPORT_COL_MAP[n]) for n in names]
+
+
+def export_gpu_row(state: DerivedGPUState, timestamp: float,
+                   columns: List[Tuple[str, str]]) -> List[str]:
+    """Extract one CSV row from a DerivedGPUState for the given columns."""
+    row: List[str] = []
+    for _col_name, key in columns:
+        if key == "_timestamp":
+            row.append(f"{timestamp:.2f}")
+        elif key == "_gpu_id":
+            row.append(state.gpu_id)
+        elif key == "_model":
+            row.append(_short_model_name(state.identity.get("modelName", "")))
+        elif key == "_real_util":
+            row.append(f"{state.real_util:.2f}")
+        elif key == "_status":
+            row.append(state.status_line)
+        elif key == "_health":
+            row.append(state.health)
+        elif key == "_mem_total_mib":
+            row.append(f"{state.memory_total_mib:.1f}" if state.memory_total_mib is not None else "")
+        elif key == "_mem_used_pct":
+            row.append(f"{state.memory_used_pct:.2f}" if state.memory_used_pct is not None else "")
+        elif key == "_nvlink_gbps":
+            gbps = bytes_per_s_to_gbps(state.rates.get(NVLINK_TOTAL_METRIC))
+            row.append(f"{gbps:.4f}" if gbps is not None else "")
+        elif key == "_pcie_replay_rate":
+            rr = state.rates.get("DCGM_FI_DEV_PCIE_REPLAY_COUNTER")
+            row.append(f"{rr:.2f}" if rr is not None else "")
+        elif key == "_energy_j":
+            row.append(f"{state.energy_j:.1f}" if state.energy_j is not None else "")
+        else:
+            raw = state.values.get(key)
+            if raw is None:
+                row.append("")
+            elif key in RATIO_0_1 or key in PERCENT_0_100:
+                pct = to_percent(key, raw)
+                row.append(f"{pct:.2f}" if pct is not None else "")
+            else:
+                row.append(f"{raw:.4f}" if isinstance(raw, float) else str(raw))
+    return row
+
+
+def filter_states_for_current_user(
+    states: List[DerivedGPUState],
+    gpu_processes: Dict[str, List[GpuProcess]],
+) -> List[DerivedGPUState]:
+    """Keep only GPUs where the current user has at least one running compute process."""
+    current_user = pwd.getpwuid(os.getuid()).pw_name
+    user_gpu_ids: Set[str] = set()
+    for gpu_id, procs in gpu_processes.items():
+        for p in procs:
+            if p.user == current_user:
+                user_gpu_ids.add(gpu_id)
+                break
+    return [s for s in states if s.gpu_id in user_gpu_ids]
+
+
 # ── System metrics ───────────────────────────────────────────────────────────
 
 def query_system_cpu() -> Tuple[Optional[int], Optional[int], Optional[float], Optional[int]]:
@@ -2044,6 +2179,19 @@ def main() -> int:
     parser.add_argument("--ai-weights", dest="weights", action="store_const", const=(0.35, 0.35, 0.20, 0.10), help="Use AI/LLM training weight preset (0.35,0.35,0.20,0.10) — this is the default")
     parser.add_argument("--hpc-weights", dest="weights", action="store_const", const=(0.45, 0.15, 0.25, 0.15), help="Use general HPC weight preset (0.45,0.15,0.25,0.15)")
     parser.add_argument("--mem-weights", dest="weights", action="store_const", const=(0.35, 0.10, 0.40, 0.15), help="Use memory-bound weight preset (0.35,0.10,0.40,0.15)")
+    parser.add_argument("--export", nargs="?", const="default", default=None, metavar="COLS",
+                        help="Output CSV to stdout. Use --export for default columns, "
+                             "--export all for every column, or --export col1,col2,... for a "
+                             "custom set. Available columns: "
+                             "timestamp,gpu_id,model,real_util_pct,status,health,"
+                             "sm_active_pct,tensor_active_pct,dram_active_pct,"
+                             "gr_engine_active_pct,gpu_util_pct,"
+                             "mem_used_mib,mem_total_mib,mem_used_pct,power_w,"
+                             "gpu_temp_c,mem_temp_c,"
+                             "sm_occupancy_pct,fp16_pipe_pct,fp32_pipe_pct,fp64_pipe_pct,"
+                             "memcpy_util_pct,pcie_rx_bytes_s,pcie_tx_bytes_s,nvlink_gbps,"
+                             "sm_clock_mhz,mem_clock_mhz,pcie_replay_rate_s,energy_j,"
+                             "tc_hmma_pct,tc_imma_pct,tc_dfma_pct,tc_dmma_pct,tc_qmma_pct")
     args = parser.parse_args()
 
     console = Console()
@@ -2108,6 +2256,48 @@ def main() -> int:
         )
 
     fetch_data()
+
+    if args.export is not None:
+        export_cols = resolve_export_columns(args.export)
+        writer = csv.writer(sys.stdout)
+        writer.writerow([col for col, _ in export_cols])
+        sys.stdout.flush()
+
+        current_user = pwd.getpwuid(os.getuid()).pw_name
+        gpu_procs = query_gpu_processes(bus_id_map)
+        filtered = filter_states_for_current_user(cached_states, gpu_procs)
+        if not filtered:
+            print(f"kempnerpulse: no GPU compute processes found for user '{current_user}' "
+                  f"on {len(cached_states)} visible GPU(s). Waiting...", file=sys.stderr)
+        timestamp = time.time()
+        for state in filtered:
+            writer.writerow(export_gpu_row(state, timestamp, export_cols))
+        sys.stdout.flush()
+
+        if not args.once:
+            warned_empty = not filtered  # already warned above on first batch
+            try:
+                while True:
+                    time.sleep(args.poll)
+                    fetch_data()
+                    gpu_procs = query_gpu_processes(bus_id_map)
+                    filtered = filter_states_for_current_user(cached_states, gpu_procs)
+                    if not filtered and not warned_empty:
+                        print(f"kempnerpulse: no GPU compute processes found for user '{current_user}'. "
+                              "Will emit rows when processes appear.", file=sys.stderr)
+                        warned_empty = True
+                    timestamp = time.time()
+                    for state in filtered:
+                        writer.writerow(export_gpu_row(state, timestamp, export_cols))
+                    sys.stdout.flush()
+            except KeyboardInterrupt:
+                pass
+            except BrokenPipeError:
+                try:
+                    sys.stdout.close()
+                except BrokenPipeError:
+                    pass
+        return 0
 
     if args.once:
         console.print(get_layout())
