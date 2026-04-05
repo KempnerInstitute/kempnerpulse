@@ -67,7 +67,7 @@ NVLINK_TOTAL_METRIC = "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL"
 
 SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 APP_NAME = "KempnerPulse GPU Dashboard"
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 EXPORT_DEFAULT_COLUMNS = (
     "timestamp", "gpu_id", "model", "gpu_util_pct", "mem_used_mib",
@@ -553,6 +553,48 @@ def query_bus_id_mapping() -> Dict[str, str]:
         if len(parts) == 2:
             mapping[parts[1].upper()] = parts[0]
     return mapping
+
+
+def resolve_dcgm_mapping(source: str) -> Tuple[Optional[Set[str]], Dict[str, str]]:
+    """Resolve physical GPU indices by matching nvidia-smi bus IDs against dcgm-exporter.
+
+    Inside a SLURM cgroup, nvidia-smi sees remapped indices (e.g. GPU 0) but
+    the same PCI bus IDs as the physical hardware.  dcgm-exporter runs outside
+    the cgroup and reports physical indices.  Matching on bus ID bridges the gap.
+
+    Returns (accessible_physical_ids, bus_id_to_physical_gpu_id).
+    accessible_physical_ids is None if resolution fails.
+    """
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=pci.bus_id", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode != 0:
+            return None, {}
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None, {}
+    local_bus_ids: Set[str] = set()
+    for line in r.stdout.strip().splitlines():
+        bid = line.strip().upper()
+        if bid:
+            local_bus_ids.add(bid)
+    if not local_bus_ids:
+        return None, {}
+    try:
+        raw = load_source(source)
+    except Exception:
+        return None, {}
+    sample = parse_prometheus_text(raw)
+    accessible_ids: Set[str] = set()
+    bus_to_physical: Dict[str, str] = {}
+    for gpu_id, labels in sample.labels.items():
+        bus_id = labels.get("pci_bus_id", "").upper()
+        if bus_id:
+            bus_to_physical[bus_id] = gpu_id
+            if bus_id in local_bus_ids:
+                accessible_ids.add(gpu_id)
+    return accessible_ids, bus_to_physical
 
 
 def query_gpu_processes(bus_to_idx: Dict[str, str]) -> Dict[str, List[GpuProcess]]:
@@ -1150,7 +1192,8 @@ def _short_model_name(name: str) -> str:
     m = re.match(r'(RTX)\s*(\d+)', s)
     if m:
         return m.group(1) + m.group(2)
-    return s.split()[0].split('-')[0]
+    parts = s.split()
+    return parts[0].split('-')[0] if parts else "GPU"
 
 
 def resolve_export_columns(spec: str) -> List[Tuple[str, str]]:
@@ -1516,7 +1559,6 @@ def _render_line_chart(
         if p >= pri[r][c]:
             grid[r][c] = (ch, cidx)
             pri[r][c] = p
-        return grid
 
     for line_idx, (_gpu_id, values) in enumerate(gpu_data):
         if not values:
@@ -2199,7 +2241,8 @@ def main() -> int:
     prev: Optional[Sample] = None
     controller = CommandController(args.focus_gpu)
 
-    accessible_gpus = query_accessible_gpus()
+    dcgm_accessible, dcgm_bus_map = resolve_dcgm_mapping(args.source)
+    accessible_gpus = dcgm_accessible if dcgm_accessible is not None else query_accessible_gpus()
     if not accessible_gpus:
         console.print("[bold red]KempnerPulse requires a node with NVIDIA GPUs.[/]")
         return 1
@@ -2210,7 +2253,7 @@ def main() -> int:
     gpu_models = query_gpu_models()
     pcie_bw_limits, pcie_info = query_pcie_bandwidth()
     nvlink_bw_limits = query_nvlink_bandwidth()
-    bus_id_map = query_bus_id_mapping()
+    bus_id_map = dcgm_bus_map or query_bus_id_mapping()
 
     current_visible_ids: Set[str] = set()
     cached_states: List[DerivedGPUState] = []
