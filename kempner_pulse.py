@@ -530,12 +530,15 @@ def load_source(source: str, timeout: float = 5.0) -> str:
 
 # ── Direct DCGM backend (dcgmi dmon) ─────────────────────────────────────────
 
-def _resolve_dcgm_gpu_ids() -> Tuple[List[str], Dict[str, str]]:
+def _resolve_dcgm_gpu_ids(discovery_stdout: str) -> Tuple[List[str], Dict[str, str]]:
     """Resolve physical GPU IDs visible to this process via dcgmi discovery.
 
     Inside a SLURM cgroup, CUDA_VISIBLE_DEVICES is remapped to 0, but dcgmi
     operates outside the cgroup and uses physical GPU indices.  We match on
     GPU UUID to find the correct physical ID(s).
+
+    Args:
+        discovery_stdout: stdout from ``dcgmi discovery -l``.
 
     Returns (physical_ids, physical_to_local_map).
     physical_to_local_map maps physical GPU ID -> local (cgroup) GPU ID,
@@ -560,26 +563,13 @@ def _resolve_dcgm_gpu_ids() -> Tuple[List[str], Dict[str, str]]:
     if not local_uuids:
         return [], {}
 
-    # Ask dcgmi for all GPUs and their UUIDs
-    try:
-        disc = subprocess.run(
-            ["dcgmi", "discovery", "-l"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if disc.returncode != 0:
-            ids = list(local_uuids.values())
-            return ids, {i: i for i in ids}
-    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-        ids = list(local_uuids.values())
-        return ids, {i: i for i in ids}
-
     # Parse dcgmi discovery output to map UUID -> physical GPU ID
-    # Format: "| GPU ID: 3   | ... UUID: GPU-xxxxxxxx-xxxx ..."
+    # Format: "| 3      | Name: ...  \n|        | Device UUID: GPU-xxxx..."
     physical_ids: List[str] = []
     phys_to_local: Dict[str, str] = {}
     current_gpu_id: Optional[str] = None
-    for line in disc.stdout.splitlines():
-        m_id = re.search(r"GPU ID:\s*(\d+)", line)
+    for line in discovery_stdout.splitlines():
+        m_id = re.search(r"^\|\s*(\d+)\s*\|", line)
         if m_id:
             current_gpu_id = m_id.group(1)
         m_uuid = re.search(r"UUID:\s*(GPU-[0-9a-fA-F-]+)", line)
@@ -597,7 +587,11 @@ def _resolve_dcgm_gpu_ids() -> Tuple[List[str], Dict[str, str]]:
 
 def load_dcgm_direct(gpu_ids: Optional[List[str]] = None,
                      interval_ms: int = 100) -> str:
-    """Collect one sample from dcgmi dmon (direct DCGM query, no Prometheus).
+    """Collect a sample from dcgmi dmon (direct DCGM query, no Prometheus).
+
+    Requests 2 samples because profiling fields (1001-1010) return N/A on the
+    first sample of each invocation (warmup).  The parser keeps the last value
+    per GPU, so the valid second sample overwrites the N/A first.
 
     Args:
         gpu_ids: Physical GPU IDs to monitor.  If None, monitors all GPUs.
@@ -606,7 +600,7 @@ def load_dcgm_direct(gpu_ids: Optional[List[str]] = None,
     Returns:
         Raw dcgmi dmon stdout text.
     """
-    cmd = ["dcgmi", "dmon", "-c", "1", "-d", str(interval_ms),
+    cmd = ["dcgmi", "dmon", "-c", "2", "-d", str(interval_ms),
            "-e", DCGM_DMON_FIELD_IDS]
     if gpu_ids:
         cmd.extend(["-i", ",".join(f"gpu:{gid}" for gid in gpu_ids)])
@@ -645,7 +639,7 @@ def parse_dcgm_dmon(text: str, gpu_models: Optional[Dict[str, str]] = None) -> S
             if val_idx >= len(parts):
                 break
             raw = parts[val_idx]
-            if raw == "N/A" or raw == "N/A\t":
+            if raw == "N/A":
                 continue
             try:
                 value = float(raw)
@@ -2371,7 +2365,7 @@ Backend selection:
                            typically ~30 seconds.  Best for fleet-level monitoring.
 
   --backend dcgm           Query dcgmi dmon directly.  Each poll cycle invokes
-                           dcgmi dmon -c 1, giving true per-sample resolution
+                           dcgmi dmon -c 2, giving true per-sample resolution
                            (down to 100ms with --poll 0.1).  Best for single-node
                            workload profiling.  Requires the DCGM daemon to be
                            running on the node.  Automatically resolves physical
@@ -2442,7 +2436,7 @@ def main() -> int:
     dcgm_phys_to_local: Dict[str, str] = {}
 
     if use_dcgm_backend:
-        # Verify dcgmi is available
+        # Verify dcgmi is available and discover GPUs in one call
         try:
             probe = subprocess.run(["dcgmi", "discovery", "-l"],
                                    capture_output=True, text=True, timeout=10)
@@ -2456,7 +2450,7 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             console.print("[bold red]dcgmi timed out. Is the DCGM daemon running?[/]")
             return 1
-        dcgm_physical_gpu_ids, dcgm_phys_to_local = _resolve_dcgm_gpu_ids()
+        dcgm_physical_gpu_ids, dcgm_phys_to_local = _resolve_dcgm_gpu_ids(probe.stdout)
         if not dcgm_physical_gpu_ids:
             console.print("[bold yellow]Warning: could not resolve physical GPU IDs; dcgmi will monitor all GPUs.[/]")
             dcgm_physical_gpu_ids = None
@@ -2485,6 +2479,16 @@ def main() -> int:
     nvlink_bw_limits = query_nvlink_bandwidth()
     bus_id_map = dcgm_bus_map or query_bus_id_mapping()
 
+    # When using dcgm backend inside a SLURM cgroup, nvidia-smi returns local
+    # GPU indices (e.g. "0") but dcgmi uses physical indices (e.g. "1").
+    # Re-key the nvidia-smi lookup dicts so they match dcgmi GPU IDs.
+    if use_dcgm_backend and dcgm_phys_to_local:
+        local_to_phys = {v: k for k, v in dcgm_phys_to_local.items()}
+        gpu_models = {local_to_phys.get(k, k): v for k, v in gpu_models.items()}
+        power_limits = {local_to_phys.get(k, k): v for k, v in power_limits.items()}
+        pcie_bw_limits = {local_to_phys.get(k, k): v for k, v in pcie_bw_limits.items()}
+        nvlink_bw_limits = {local_to_phys.get(k, k): v for k, v in nvlink_bw_limits.items()}
+
     current_visible_ids: Set[str] = set()
     cached_states: List[DerivedGPUState] = []
     cached_gpu_procs: Dict[str, List[GpuProcess]] = {}
@@ -2494,12 +2498,16 @@ def main() -> int:
     def fetch_data() -> None:
         nonlocal prev, current_visible_ids, cached_states, cached_gpu_procs
         nonlocal cached_cpu_info, cached_ram_info
-        if use_dcgm_backend:
-            raw = load_dcgm_direct(gpu_ids=dcgm_physical_gpu_ids)
-            sample = parse_dcgm_dmon(raw, gpu_models)
-        else:
-            raw = load_source(args.source)
-            sample = parse_prometheus_text(raw)
+        try:
+            if use_dcgm_backend:
+                raw = load_dcgm_direct(gpu_ids=dcgm_physical_gpu_ids)
+                sample = parse_dcgm_dmon(raw, gpu_models)
+            else:
+                raw = load_source(args.source)
+                sample = parse_prometheus_text(raw)
+        except Exception as exc:
+            print(f"kempnerpulse: data fetch failed: {exc}", file=sys.stderr)
+            return
         filtered_sample = filter_sample_to_gpu_ids(sample, allowed_gpu_ids)
         filtered_prev = filter_sample_to_gpu_ids(prev, allowed_gpu_ids) if prev is not None else None
         cached_states = build_gpu_states(filtered_sample, filtered_prev, args.weights, gpu_models)
