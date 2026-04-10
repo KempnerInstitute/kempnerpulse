@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""KempnerPulse – real-time GPU monitoring dashboard for DCGM Prometheus metrics.
+"""KempnerPulse – real-time GPU monitoring and dashboard for DCGM Prometheus metrics.
 
 Single-file Rich-based TUI that streams DCGM-exporter /metrics and renders
 Fleet View, Focus View, Plot View, and Job View in the terminal.
@@ -64,6 +64,40 @@ COUNTER_METRICS = {
 }
 
 NVLINK_TOTAL_METRIC = "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL"
+
+# ── Direct DCGM backend (dcgmi dmon) ─────────────────────────────────────────
+# Maps DCGM field IDs to the metric names used throughout KempnerPulse.
+# Order matters: it determines column positions in dcgmi dmon output.
+DCGM_DMON_FIELDS: Tuple[Tuple[int, str], ...] = (
+    # Device-level metrics
+    (100,  "DCGM_FI_DEV_SM_CLOCK"),               # MHz
+    (101,  "DCGM_FI_DEV_MEM_CLOCK"),              # MHz
+    (140,  "DCGM_FI_DEV_MEMORY_TEMP"),             # Celsius
+    (150,  "DCGM_FI_DEV_GPU_TEMP"),                # Celsius
+    (155,  "DCGM_FI_DEV_POWER_USAGE"),             # Watts
+    (156,  "DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION"),# millijoules (counter)
+    (202,  "DCGM_FI_DEV_PCIE_REPLAY_COUNTER"),     # counter
+    (203,  "DCGM_FI_DEV_GPU_UTIL"),                # 0-100%
+    (204,  "DCGM_FI_DEV_MEM_COPY_UTIL"),           # 0-100%
+    (251,  "DCGM_FI_DEV_FB_FREE"),                 # MiB
+    (252,  "DCGM_FI_DEV_FB_USED"),                 # MiB
+    (253,  "DCGM_FI_DEV_FB_RESERVED"),             # MiB
+    (449,  "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL"),  # bytes (counter)
+    # Profiling metrics (ratio 0-1)
+    (1001, "DCGM_FI_PROF_GR_ENGINE_ACTIVE"),
+    (1002, "DCGM_FI_PROF_SM_ACTIVE"),
+    (1003, "DCGM_FI_PROF_SM_OCCUPANCY"),
+    (1004, "DCGM_FI_PROF_PIPE_TENSOR_ACTIVE"),
+    (1005, "DCGM_FI_PROF_DRAM_ACTIVE"),
+    (1006, "DCGM_FI_PROF_PIPE_FP64_ACTIVE"),
+    (1007, "DCGM_FI_PROF_PIPE_FP32_ACTIVE"),
+    (1008, "DCGM_FI_PROF_PIPE_FP16_ACTIVE"),
+    (1009, "DCGM_FI_PROF_PCIE_TX_BYTES"),          # bytes/sec
+    (1010, "DCGM_FI_PROF_PCIE_RX_BYTES"),          # bytes/sec
+)
+
+DCGM_DMON_FIELD_IDS = ",".join(str(fid) for fid, _ in DCGM_DMON_FIELDS)
+DCGM_DMON_METRIC_NAMES = [name for _, name in DCGM_DMON_FIELDS]
 
 SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 APP_NAME = "KempnerPulse GPU Dashboard"
@@ -492,6 +526,135 @@ def load_source(source: str, timeout: float = 5.0) -> str:
             return resp.read().decode("utf-8", errors="replace")
     with open(source, "r", encoding="utf-8", errors="replace") as f:
         return f.read()
+
+
+# ── Direct DCGM backend (dcgmi dmon) ─────────────────────────────────────────
+
+def _resolve_dcgm_gpu_ids(discovery_stdout: str) -> Tuple[List[str], Dict[str, str]]:
+    """Resolve physical GPU IDs visible to this process via dcgmi discovery.
+
+    Inside a SLURM cgroup, CUDA_VISIBLE_DEVICES is remapped to 0, but dcgmi
+    operates outside the cgroup and uses physical GPU indices.  We match on
+    GPU UUID to find the correct physical ID(s).
+
+    Args:
+        discovery_stdout: stdout from ``dcgmi discovery -l``.
+
+    Returns (physical_ids, physical_to_local_map).
+    physical_to_local_map maps physical GPU ID -> local (cgroup) GPU ID,
+    needed so that --export can match dcgmi GPU IDs against nvidia-smi process IDs.
+    """
+    try:
+        nvsmi = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if nvsmi.returncode != 0:
+            return [], {}
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return [], {}
+
+    local_uuids: Dict[str, str] = {}  # uuid -> local_index
+    for line in nvsmi.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",", 1)]
+        if len(parts) == 2:
+            local_uuids[parts[1]] = parts[0]
+
+    if not local_uuids:
+        return [], {}
+
+    # Parse dcgmi discovery output to map UUID -> physical GPU ID
+    # Format: "| 3      | Name: ...  \n|        | Device UUID: GPU-xxxx..."
+    physical_ids: List[str] = []
+    phys_to_local: Dict[str, str] = {}
+    current_gpu_id: Optional[str] = None
+    for line in discovery_stdout.splitlines():
+        m_id = re.search(r"^\|\s*(\d+)\s*\|", line)
+        if m_id:
+            current_gpu_id = m_id.group(1)
+        m_uuid = re.search(r"UUID:\s*(GPU-[0-9a-fA-F-]+)", line)
+        if m_uuid and current_gpu_id is not None:
+            if m_uuid.group(1) in local_uuids:
+                physical_ids.append(current_gpu_id)
+                phys_to_local[current_gpu_id] = local_uuids[m_uuid.group(1)]
+            current_gpu_id = None
+
+    if not physical_ids:
+        ids = list(local_uuids.values())
+        return ids, {i: i for i in ids}
+    return physical_ids, phys_to_local
+
+
+def load_dcgm_direct(gpu_ids: Optional[List[str]] = None,
+                     interval_ms: int = 100) -> str:
+    """Collect a sample from dcgmi dmon (direct DCGM query, no Prometheus).
+
+    Requests 2 samples because profiling fields (1001-1010) return N/A on the
+    first sample of each invocation (warmup).  The parser keeps the last value
+    per GPU, so the valid second sample overwrites the N/A first.
+
+    Args:
+        gpu_ids: Physical GPU IDs to monitor.  If None, monitors all GPUs.
+        interval_ms: Sampling interval in milliseconds (default 100).
+
+    Returns:
+        Raw dcgmi dmon stdout text.
+    """
+    cmd = ["dcgmi", "dmon", "-c", "2", "-d", str(interval_ms),
+           "-e", DCGM_DMON_FIELD_IDS]
+    if gpu_ids:
+        cmd.extend(["-i", ",".join(f"gpu:{gid}" for gid in gpu_ids)])
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    if result.returncode != 0:
+        raise RuntimeError(f"dcgmi dmon failed (exit {result.returncode}): {result.stderr.strip()}")
+    return result.stdout
+
+
+def parse_dcgm_dmon(text: str, gpu_models: Optional[Dict[str, str]] = None) -> Sample:
+    """Parse dcgmi dmon output into a Sample (same format as Prometheus parser).
+
+    dcgmi dmon output format (columns match DCGM_DMON_FIELDS order):
+        #Entity   GPUTL  POWER  GTEMP  MTEMP  ...
+        ID
+        GPU 0     72     155.3  65     58     ...
+
+    Values marked N/A or that fail float conversion are skipped.
+    """
+    metrics: Dict[str, Dict[str, float]] = defaultdict(dict)
+    labels: Dict[str, Dict[str, str]] = defaultdict(dict)
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("ID"):
+            continue
+        parts = line.split()
+        if len(parts) < 2 or parts[0] != "GPU":
+            continue
+
+        gpu_id = parts[1]
+        # Remaining columns correspond 1:1 to DCGM_DMON_METRIC_NAMES
+        for col_idx, metric_name in enumerate(DCGM_DMON_METRIC_NAMES):
+            val_idx = col_idx + 2  # skip "GPU" and gpu_id
+            if val_idx >= len(parts):
+                break
+            raw = parts[val_idx]
+            if raw == "N/A":
+                continue
+            try:
+                value = float(raw)
+            except ValueError:
+                continue
+            if math.isinf(value) or math.isnan(value):
+                continue
+            metrics[gpu_id][metric_name] = value
+
+        # Populate labels for compatibility with the rest of the pipeline
+        labels[gpu_id]["gpu"] = gpu_id
+        if gpu_models and gpu_id in gpu_models:
+            labels[gpu_id]["modelName"] = gpu_models[gpu_id]
+
+    return Sample(ts=time.time(), metrics=dict(metrics), labels=dict(labels))
 
 
 # ── nvidia-smi hardware queries ──────────────────────────────────────────────
@@ -1257,8 +1420,14 @@ def export_gpu_row(state: DerivedGPUState, timestamp: float,
 def filter_states_for_current_user(
     states: List[DerivedGPUState],
     gpu_processes: Dict[str, List[GpuProcess]],
+    phys_to_local: Optional[Dict[str, str]] = None,
 ) -> List[DerivedGPUState]:
-    """Keep only GPUs where the current user has at least one running compute process."""
+    """Keep only GPUs where the current user has at least one running compute process.
+
+    phys_to_local: when using the dcgm backend inside a SLURM cgroup, state gpu_ids
+    are physical (from dcgmi) while gpu_processes keys are local (from nvidia-smi).
+    This map bridges the two so the filter can match correctly.
+    """
     current_user = pwd.getpwuid(os.getuid()).pw_name
     user_gpu_ids: Set[str] = set()
     for gpu_id, procs in gpu_processes.items():
@@ -1266,6 +1435,8 @@ def filter_states_for_current_user(
             if p.user == current_user:
                 user_gpu_ids.add(gpu_id)
                 break
+    if phys_to_local:
+        return [s for s in states if phys_to_local.get(s.gpu_id, s.gpu_id) in user_gpu_ids]
     return [s for s in states if s.gpu_id in user_gpu_ids]
 
 
@@ -1438,8 +1609,8 @@ def gpu_card(state: DerivedGPUState, history: HistoryStore, power_limit: Optiona
     table.add_column(ratio=1)
 
     left = Table.grid(padding=(0, 1))
-    left.add_column(justify="left")
-    left.add_column(justify="right")
+    left.add_column(justify="left", min_width=11, no_wrap=True)
+    left.add_column(justify="right", min_width=18, no_wrap=True)
     left.add_row("Real util", Text(fmt_pct(state.real_util), style=usage_style(state.real_util)))
     left.add_row("GPU util", Text(fmt_pct(gpu_util), style=usage_style(gpu_util)))
     left.add_row("GR active", Text(fmt_pct(gr_active), style=usage_style(gr_active)))
@@ -1464,8 +1635,8 @@ def gpu_card(state: DerivedGPUState, history: HistoryStore, power_limit: Optiona
     ))
 
     right = Table.grid(padding=(0, 1))
-    right.add_column(justify="left")
-    right.add_column(justify="right")
+    right.add_column(justify="left", min_width=11, no_wrap=True)
+    right.add_column(justify="right", min_width=22, no_wrap=True)
     memcpy_pct = to_percent("DCGM_FI_DEV_MEM_COPY_UTIL", state.values.get("DCGM_FI_DEV_MEM_COPY_UTIL"))
     nvlink_gbps = bytes_per_s_to_gbps(state.rates.get(NVLINK_TOTAL_METRIC))
     right.add_row("Memcpy", Text(fmt_pct(memcpy_pct), style=usage_style(memcpy_pct)))
@@ -1477,7 +1648,7 @@ def gpu_card(state: DerivedGPUState, history: HistoryStore, power_limit: Optiona
     right.add_row("SM clock", Text(fmt_mhz(state.values.get("DCGM_FI_DEV_SM_CLOCK")), style="green"))
     right.add_row("MEM clock", Text(fmt_mhz(state.values.get("DCGM_FI_DEV_MEM_CLOCK")), style="green"))
     right.add_row("Energy", Text(fmt_joules(state.energy_j), style="magenta"))
-    right.add_row("Status", Text(state.status_line, style=state.health_style))
+    right.add_row("Status", Text(f"{state.status_line:<22}", style=state.health_style))
 
     table.add_row(left, right)
 
@@ -2187,6 +2358,19 @@ Interactive commands:
   Ctrl+C       Exit the dashboard
   Esc          Cancel an unfinished command after ':'
 
+Backend selection:
+  --backend prometheus     (default) Read metrics from the dcgm-exporter
+                           Prometheus HTTP endpoint.  Profiling fields (SM, tensor,
+                           DRAM) update at the exporter's configured interval,
+                           typically ~30 seconds.  Best for fleet-level monitoring.
+
+  --backend dcgm           Query dcgmi dmon directly.  Each poll cycle invokes
+                           dcgmi dmon -c 2, giving true per-sample resolution
+                           (down to 100ms with --poll 0.1).  Best for single-node
+                           workload profiling.  Requires the DCGM daemon to be
+                           running on the node.  Automatically resolves physical
+                           GPU IDs inside SLURM cgroups.
+
 Examples:
   python3 kempner_pulse.py
   python3 kempner_pulse.py --poll 1.0
@@ -2198,6 +2382,8 @@ Examples:
   python3 kempner_pulse.py --show-all
   python3 kempner_pulse.py --source http://otherhost:9400/metrics
   python3 kempner_pulse.py --source /path/to/dcgm_metrics.txt
+  python3 kempner_pulse.py --backend dcgm --poll 0.5
+  python3 kempner_pulse.py --backend dcgm --export all --poll 0.1
 """
 
 
@@ -2211,6 +2397,10 @@ def main() -> int:
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--source", default="http://localhost:9400/metrics", help="Path to a dcgm-exporter text file or an http(s) /metrics endpoint. Default: http://localhost:9400/metrics")
+    parser.add_argument("--backend", choices=["prometheus", "dcgm"], default="prometheus",
+                        help="Metric collection backend. 'prometheus' reads from dcgm-exporter HTTP endpoint "
+                             "(~30s resolution for profiling fields). 'dcgm' queries dcgmi dmon directly for "
+                             "true high-resolution sampling (down to 100ms). Default: prometheus")
     parser.add_argument("--poll", type=float, default=1.0, help="UI refresh interval in seconds. This redraws the dashboard; it does not force DCGM itself to sample faster. Default: 1.0")
     parser.add_argument("--history", type=int, default=120, help="Number of samples kept for sparkline history. Default: 120")
     parser.add_argument("--focus-gpu", default=None, help="Start in focused view for one GPU id, for example 0")
@@ -2241,8 +2431,42 @@ def main() -> int:
     prev: Optional[Sample] = None
     controller = CommandController(args.focus_gpu)
 
-    dcgm_accessible, dcgm_bus_map = resolve_dcgm_mapping(args.source)
-    accessible_gpus = dcgm_accessible if dcgm_accessible is not None else query_accessible_gpus()
+    use_dcgm_backend = args.backend == "dcgm"
+    dcgm_physical_gpu_ids: Optional[List[str]] = None
+    dcgm_phys_to_local: Dict[str, str] = {}
+
+    if use_dcgm_backend:
+        # Verify dcgmi is available and discover GPUs in one call
+        try:
+            probe = subprocess.run(["dcgmi", "discovery", "-l"],
+                                   capture_output=True, text=True, timeout=10)
+            if probe.returncode != 0:
+                console.print("[bold red]dcgmi not available or DCGM daemon not running.[/]")
+                console.print(f"[dim]stderr: {probe.stderr.strip()}[/]")
+                return 1
+        except FileNotFoundError:
+            console.print("[bold red]dcgmi command not found. Install DCGM or use --backend prometheus.[/]")
+            return 1
+        except subprocess.TimeoutExpired:
+            console.print("[bold red]dcgmi timed out. Is the DCGM daemon running?[/]")
+            return 1
+        dcgm_physical_gpu_ids, dcgm_phys_to_local = _resolve_dcgm_gpu_ids(probe.stdout)
+        if not dcgm_physical_gpu_ids:
+            console.print("[bold yellow]Warning: could not resolve physical GPU IDs; dcgmi will monitor all GPUs.[/]")
+            dcgm_physical_gpu_ids = None
+            dcgm_phys_to_local = {}
+
+    if use_dcgm_backend:
+        # For dcgm backend, accessible GPUs come from nvidia-smi directly
+        dcgm_accessible, dcgm_bus_map = None, {}
+        accessible_gpus = query_accessible_gpus()
+        # Map physical IDs as accessible when using dcgm backend
+        if dcgm_physical_gpu_ids:
+            accessible_gpus = set(dcgm_physical_gpu_ids)
+    else:
+        dcgm_accessible, dcgm_bus_map = resolve_dcgm_mapping(args.source)
+        accessible_gpus = dcgm_accessible if dcgm_accessible is not None else query_accessible_gpus()
+
     if not accessible_gpus:
         console.print("[bold red]KempnerPulse requires a node with NVIDIA GPUs.[/]")
         return 1
@@ -2255,6 +2479,16 @@ def main() -> int:
     nvlink_bw_limits = query_nvlink_bandwidth()
     bus_id_map = dcgm_bus_map or query_bus_id_mapping()
 
+    # When using dcgm backend inside a SLURM cgroup, nvidia-smi returns local
+    # GPU indices (e.g. "0") but dcgmi uses physical indices (e.g. "1").
+    # Re-key the nvidia-smi lookup dicts so they match dcgmi GPU IDs.
+    if use_dcgm_backend and dcgm_phys_to_local:
+        local_to_phys = {v: k for k, v in dcgm_phys_to_local.items()}
+        gpu_models = {local_to_phys.get(k, k): v for k, v in gpu_models.items()}
+        power_limits = {local_to_phys.get(k, k): v for k, v in power_limits.items()}
+        pcie_bw_limits = {local_to_phys.get(k, k): v for k, v in pcie_bw_limits.items()}
+        nvlink_bw_limits = {local_to_phys.get(k, k): v for k, v in nvlink_bw_limits.items()}
+
     current_visible_ids: Set[str] = set()
     cached_states: List[DerivedGPUState] = []
     cached_gpu_procs: Dict[str, List[GpuProcess]] = {}
@@ -2264,8 +2498,16 @@ def main() -> int:
     def fetch_data() -> None:
         nonlocal prev, current_visible_ids, cached_states, cached_gpu_procs
         nonlocal cached_cpu_info, cached_ram_info
-        raw = load_source(args.source)
-        sample = parse_prometheus_text(raw)
+        try:
+            if use_dcgm_backend:
+                raw = load_dcgm_direct(gpu_ids=dcgm_physical_gpu_ids)
+                sample = parse_dcgm_dmon(raw, gpu_models)
+            else:
+                raw = load_source(args.source)
+                sample = parse_prometheus_text(raw)
+        except Exception as exc:
+            print(f"kempnerpulse: data fetch failed: {exc}", file=sys.stderr)
+            return
         filtered_sample = filter_sample_to_gpu_ids(sample, allowed_gpu_ids)
         filtered_prev = filter_sample_to_gpu_ids(prev, allowed_gpu_ids) if prev is not None else None
         cached_states = build_gpu_states(filtered_sample, filtered_prev, args.weights, gpu_models)
@@ -2279,11 +2521,13 @@ def main() -> int:
             controller.focus_gpu = sorted(current_visible_ids, key=lambda x: int(x) if x.isdigit() else x)[0]
             controller.last_message = f"Focused GPU unavailable; switched to GPU {controller.focus_gpu}"
 
+    source_label = "dcgmi dmon (direct)" if use_dcgm_backend else args.source
+
     def get_layout() -> Layout:
         return render_dashboard(
             cached_states,
             history,
-            args.source,
+            source_label,
             args.poll,
             controller,
             selection_desc,
@@ -2308,7 +2552,8 @@ def main() -> int:
 
         current_user = pwd.getpwuid(os.getuid()).pw_name
         gpu_procs = query_gpu_processes(bus_id_map)
-        filtered = filter_states_for_current_user(cached_states, gpu_procs)
+        _p2l = dcgm_phys_to_local if use_dcgm_backend else None
+        filtered = filter_states_for_current_user(cached_states, gpu_procs, _p2l)
         if not filtered:
             print(f"kempnerpulse: no GPU compute processes found for user '{current_user}' "
                   f"on {len(cached_states)} visible GPU(s). Waiting...", file=sys.stderr)
@@ -2324,7 +2569,7 @@ def main() -> int:
                     time.sleep(args.poll)
                     fetch_data()
                     gpu_procs = query_gpu_processes(bus_id_map)
-                    filtered = filter_states_for_current_user(cached_states, gpu_procs)
+                    filtered = filter_states_for_current_user(cached_states, gpu_procs, _p2l)
                     if not filtered and not warned_empty:
                         print(f"kempnerpulse: no GPU compute processes found for user '{current_user}'. "
                               "Will emit rows when processes appear.", file=sys.stderr)

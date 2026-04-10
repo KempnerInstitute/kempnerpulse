@@ -1,10 +1,10 @@
 # DCGM Metrics Reference
 
-KempnerPulse reads
-[DCGM](https://developer.nvidia.com/dcgm) metrics exposed by
-[dcgm-exporter](https://github.com/NVIDIA/dcgm-exporter) in Prometheus
-text format. This page lists every metric the dashboard consumes, grouped by
-category.
+KempnerPulse reads [DCGM](https://developer.nvidia.com/dcgm) metrics via one
+of two backends: [dcgm-exporter](https://github.com/NVIDIA/dcgm-exporter)
+Prometheus HTTP endpoint (`--backend prometheus`, default) or `dcgmi dmon`
+direct queries (`--backend dcgm`). This page lists every metric the dashboard
+consumes, grouped by category.
 
 > **NVIDIA docs:**
 > [DCGM API Reference: Field Identifiers](https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html)
