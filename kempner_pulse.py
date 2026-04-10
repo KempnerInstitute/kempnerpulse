@@ -101,7 +101,7 @@ DCGM_DMON_METRIC_NAMES = [name for _, name in DCGM_DMON_FIELDS]
 
 SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 APP_NAME = "KempnerPulse GPU Dashboard"
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 EXPORT_DEFAULT_COLUMNS = (
     "timestamp", "gpu_id", "model", "gpu_util_pct", "mem_used_mib",
