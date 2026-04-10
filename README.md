@@ -4,10 +4,11 @@
 
 > `nvidia-smi` says 100% GPU utilization - but are your tensor cores even active? KempnerPulse shows what's *actually* happening.
 
-Real-time GPU monitoring dashboard for DCGM Prometheus metrics. A single-file
-Rich-based TUI that streams
-[dcgm-exporter](https://github.com/NVIDIA/dcgm-exporter) `/metrics` and
-renders four interactive views in the terminal.
+Real-time GPU monitoring dashboard for DCGM metrics. A single-file
+Rich-based TUI that streams metrics from
+[dcgm-exporter](https://github.com/NVIDIA/dcgm-exporter) via Prometheus HTTP
+or directly from `dcgmi dmon` for high-resolution profiling (~100 ms),
+and renders four interactive views in the terminal.
 
 ![KempnerPulse Demo](https://raw.githubusercontent.com/KempnerInstitute/kempnerpulse/main/docs/images/kempner_pulse_screen_record.gif)
 
@@ -28,6 +29,9 @@ renders four interactive views in the terminal.
   with color-coded alerts.
 - **SLURM/CUDA Aware** : Automatically detects `CUDA_VISIBLE_DEVICES`,
   `SLURM_JOB_GPUS`, etc. to show only your allocated GPUs.
+- **Direct DCGM Backend** : `--backend dcgm` queries `dcgmi dmon` directly,
+  bypassing dcgm-exporter for true high-resolution sampling. Automatically
+  resolves physical GPU IDs inside SLURM cgroups.
 - **Zero Dependencies** beyond Python 3.9+ and `rich`.
 
 ## Screenshots
@@ -60,7 +64,8 @@ Running GPU compute processes with per-GPU metrics.
 
 - Linux with NVIDIA GPUs
 - [dcgm-exporter](https://github.com/NVIDIA/dcgm-exporter) running and
-  exposing `/metrics` (default: `http://localhost:9400/metrics`)
+  exposing `/metrics` (default: `http://localhost:9400/metrics`) — or
+  `dcgmi` CLI available for `--backend dcgm`
 - Python >= 3.9
 - `nvidia-smi` on the PATH (for hardware queries and process listing)
 
@@ -94,6 +99,9 @@ kempnerpulse --show-all
 
 # Start in focus view for GPU 0
 kempnerpulse --focus-gpu 0
+
+# Use direct DCGM backend (bypasses Prometheus, higher resolution)
+kempnerpulse --backend dcgm
 
 # Use HPC weight preset
 kempnerpulse --hpc-weights
@@ -131,7 +139,8 @@ kempnerpulse --export --once
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--version` | | | Show version and exit. |
-| `--source URL` | string | `http://localhost:9400/metrics` | dcgm-exporter `/metrics` endpoint or a local text file. |
+| `--backend` | string | `prometheus` | Data source backend: `prometheus` (dcgm-exporter HTTP) or `dcgm` (dcgmi dmon direct). |
+| `--source URL` | string | `http://localhost:9400/metrics` | dcgm-exporter `/metrics` endpoint or a local text file (prometheus backend only). |
 | `--poll SECS` | float | `1.0` | Dashboard redraw interval in seconds (does not change DCGM sampling rate). |
 | `--history N` | int | `120` | Number of samples kept for sparkline history. |
 | `--focus-gpu ID` | string | | Start in Focus View for the given GPU id (e.g. `0`). |
@@ -171,9 +180,11 @@ Custom: `--weights 0.40,0.30,0.20,0.10` (values are normalized automatically).
 
 ## How It Works
 
-KempnerPulse reads Prometheus text-format metrics from dcgm-exporter via HTTP
-(or a local file). It computes a **Real Utilization** score as a weighted
-combination of four DCGM profiling counters:
+KempnerPulse reads GPU metrics via one of two backends: **Prometheus**
+(dcgm-exporter HTTP endpoint, ~30 s update interval for profiling fields) or
+**DCGM direct** (`dcgmi dmon`, configurable down to ~100 ms).
+It computes a **Real Utilization** score as a weighted combination of four
+DCGM profiling counters:
 
 ```
 Real Util = clamp(0, 100,
