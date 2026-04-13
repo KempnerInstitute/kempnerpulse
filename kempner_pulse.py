@@ -681,6 +681,38 @@ def parse_dcgm_dmon(text: str, gpu_models: Optional[Dict[str, str]] = None) -> S
 DCGM_STREAM_MIN_INTERVAL_MS = 100   # DCGM profiling refresh floor (see probe notes)
 
 
+def fmt_duration(seconds: float, *, signed: bool = False) -> str:
+    """Compact duration label that picks units to keep the number readable.
+
+    Used by the footer's ``poll=`` indicator and the line-plot x-axis so that
+    sub-second values do not all collapse to ``0s``.
+
+    Examples:
+        fmt_duration(1.0)    -> "1s"
+        fmt_duration(0.5)    -> "500ms"
+        fmt_duration(0.05)   -> "50ms"
+        fmt_duration(0.001)  -> "1ms"
+        fmt_duration(0.0)    -> "0s"
+        fmt_duration(-2.5, signed=True) -> "-2.5s"
+    """
+    if seconds == 0:
+        return "0s"
+    sign = "-" if (signed and seconds < 0) else ""
+    val = abs(seconds)
+    if val >= 1.0:
+        # 1.5s, 30s, 600s — drop the decimal once we're past 10s.
+        if val >= 10:
+            return f"{sign}{val:.0f}s"
+        return f"{sign}{val:.1f}s".replace(".0s", "s")
+    ms = val * 1000.0
+    if ms >= 1.0:
+        if ms >= 10:
+            return f"{sign}{ms:.0f}ms"
+        return f"{sign}{ms:.1f}ms".replace(".0ms", "ms")
+    # Sub-millisecond: round up to 1ms rather than printing "0ms".
+    return f"{sign}1ms"
+
+
 class DcgmStreamError(RuntimeError):
     """Raised when the dcgmi streaming subprocess fails or exits unexpectedly."""
 
@@ -2106,7 +2138,7 @@ class LinePlotRenderable:
                 frac = i / n_ticks
                 col = int(frac * (chart_cols - 1))
                 secs = total_s * (1.0 - frac)
-                label = f"-{secs:.0f}s" if secs > 0 else "0s"
+                label = fmt_duration(-secs, signed=True) if secs > 0 else "0s"
                 # Place label starting at col, but don't overflow
                 start = max(0, min(col, chart_cols - len(label)))
                 for j, ch in enumerate(label):
@@ -2438,7 +2470,7 @@ def footer_panel(selection_desc: str, controller: CommandController, source: str
     )
     left.no_wrap = True
     left.overflow = "ellipsis"
-    right_plain = f"host={hostname}  src={display_source}  poll={poll:.1f}s  {now_str}"
+    right_plain = f"host={hostname}  src={display_source}  poll={fmt_duration(poll)}  {now_str}"
     right = Text(right_plain, style="dim", no_wrap=True)
     right_w = len(right_plain)
     line = Table.grid(expand=True)
