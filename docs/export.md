@@ -1,8 +1,10 @@
 # CSV Export Reference
 
 KempnerPulse can export GPU metrics as CSV for offline analysis or terminal
-monitoring. Only GPUs where the current user has running compute processes are
-included (same ownership detection as Job View).
+monitoring. Rows are emitted for every GPU in the visibility set
+(`CUDA_VISIBLE_DEVICES` / `SLURM_JOB_GPUS` / `--gpus` / `--show-all`),
+regardless of whether a compute process is currently running. This lets you
+start the recorder before a job launches so the trace covers job startup.
 
 ## Usage
 

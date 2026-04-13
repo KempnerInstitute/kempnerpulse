@@ -940,27 +940,6 @@ class DcgmStreamReader:
             self._cond.notify_all()
 
 
-class OwnershipCache:
-    """Caches the result of ``query_gpu_processes`` with a short TTL.
-
-    Used by the export loop so that nvidia-smi is not spawned every tick when
-    ``--poll`` is small. Process ownership rarely changes at sub-second scales.
-    """
-
-    def __init__(self, bus_id_map: Dict[str, str], ttl: float = 2.0):
-        self._bus_id_map = bus_id_map
-        self._ttl = ttl
-        self._last_refresh: float = 0.0
-        self._cached: Dict[str, List["GpuProcess"]] = {}
-
-    def get(self, now: Optional[float] = None) -> Dict[str, List["GpuProcess"]]:
-        t = now if now is not None else time.time()
-        if t - self._last_refresh >= self._ttl or not self._cached:
-            self._cached = query_gpu_processes(self._bus_id_map)
-            self._last_refresh = t
-        return self._cached
-
-
 # ── nvidia-smi hardware queries ──────────────────────────────────────────────
 
 def query_power_limits() -> Dict[str, float]:
@@ -1719,29 +1698,6 @@ def export_gpu_row(state: DerivedGPUState, timestamp: float,
             else:
                 row.append(f"{raw:.4f}" if isinstance(raw, float) else str(raw))
     return row
-
-
-def filter_states_for_current_user(
-    states: List[DerivedGPUState],
-    gpu_processes: Dict[str, List[GpuProcess]],
-    phys_to_local: Optional[Dict[str, str]] = None,
-) -> List[DerivedGPUState]:
-    """Keep only GPUs where the current user has at least one running compute process.
-
-    phys_to_local: when using the dcgm backend inside a SLURM cgroup, state gpu_ids
-    are physical (from dcgmi) while gpu_processes keys are local (from nvidia-smi).
-    This map bridges the two so the filter can match correctly.
-    """
-    current_user = pwd.getpwuid(os.getuid()).pw_name
-    user_gpu_ids: Set[str] = set()
-    for gpu_id, procs in gpu_processes.items():
-        for p in procs:
-            if p.user == current_user:
-                user_gpu_ids.add(gpu_id)
-                break
-    if phys_to_local:
-        return [s for s in states if phys_to_local.get(s.gpu_id, s.gpu_id) in user_gpu_ids]
-    return [s for s in states if s.gpu_id in user_gpu_ids]
 
 
 # ── System metrics ───────────────────────────────────────────────────────────
@@ -2919,27 +2875,24 @@ def main() -> int:
         writer.writerow([col for col, _ in export_cols])
         sys.stdout.flush()
 
-        current_user = pwd.getpwuid(os.getuid()).pw_name
-        _p2l = dcgm_phys_to_local if use_dcgm_backend else None
-        ownership = OwnershipCache(bus_id_map, ttl=2.0)
-
+        # Export emits rows for every GPU in the visibility set
+        # (CUDA_VISIBLE_DEVICES / SLURM_JOB_GPUS / --gpus). No ownership
+        # filter: the user can launch the recorder before their job starts
+        # so the trace covers job startup.
         warned_empty = False
 
         def emit_rows() -> None:
             nonlocal warned_empty
-            gpu_procs = ownership.get()
-            filtered = filter_states_for_current_user(cached_states, gpu_procs, _p2l)
-            if not filtered:
+            if not cached_states:
                 if not warned_empty:
-                    print(f"kempnerpulse: no GPU compute processes found for user "
-                          f"'{current_user}' on {len(cached_states)} visible GPU(s). "
-                          "Will emit rows when processes appear.", file=sys.stderr)
+                    print("kempnerpulse: no visible GPUs in the data source yet. "
+                          "Will emit rows when they appear.", file=sys.stderr)
                     warned_empty = True
                 return
             warned_empty = False
             timestamp = time.time()
             try:
-                for state in filtered:
+                for state in cached_states:
                     writer.writerow(export_gpu_row(state, timestamp, export_cols))
                 sys.stdout.flush()
             except BrokenPipeError:

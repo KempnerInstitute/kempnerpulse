@@ -151,7 +151,7 @@ kempnerpulse --export --once
 | `--ai-weights` | preset | | AI/LLM training preset `(0.35, 0.35, 0.20, 0.10)`. This is the default. |
 | `--hpc-weights` | preset | | HPC / mixed CUDA preset `(0.45, 0.15, 0.25, 0.15)`. |
 | `--mem-weights` | preset | | Memory-bound / bandwidth-heavy preset `(0.35, 0.10, 0.40, 0.15)`. |
-| `--export` | string | *(off)* | Output CSV to stdout. `--export` for default columns, `--export all` for every column, or `--export col1,col2,...` for a custom set. Only GPUs with processes owned by the current user are included. |
+| `--export` | string | *(off)* | Output CSV to stdout. `--export` for default columns, `--export all` for every column, or `--export col1,col2,...` for a custom set. Rows are emitted for every GPU in the visibility set (`CUDA_VISIBLE_DEVICES` / `SLURM_JOB_GPUS` / `--gpus`), so you can start the recorder before your job launches. |
 
 ### GPU Visibility Selection
 
