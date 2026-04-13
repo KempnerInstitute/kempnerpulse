@@ -777,6 +777,11 @@ class DcgmStreamReader:
                 raise DcgmStreamError(str(self._error))
             return self._latest, self._prev
 
+    def last_counter(self) -> int:
+        """Current value of the sample counter (for pairing with wait_for_new)."""
+        with self._cond:
+            return self._counter
+
     def wait_for_new(self,
                      last_counter: int,
                      timeout: float = 2.0,
@@ -2883,40 +2888,61 @@ def main() -> int:
         sys.stdout.flush()
 
         current_user = pwd.getpwuid(os.getuid()).pw_name
-        gpu_procs = query_gpu_processes(bus_id_map)
         _p2l = dcgm_phys_to_local if use_dcgm_backend else None
-        filtered = filter_states_for_current_user(cached_states, gpu_procs, _p2l)
-        if not filtered:
-            print(f"kempnerpulse: no GPU compute processes found for user '{current_user}' "
-                  f"on {len(cached_states)} visible GPU(s). Waiting...", file=sys.stderr)
-        timestamp = time.time()
-        for state in filtered:
-            writer.writerow(export_gpu_row(state, timestamp, export_cols))
-        sys.stdout.flush()
+        ownership = OwnershipCache(bus_id_map, ttl=2.0)
 
-        if not args.once:
-            warned_empty = not filtered  # already warned above on first batch
+        warned_empty = False
+
+        def emit_rows() -> None:
+            nonlocal warned_empty
+            gpu_procs = ownership.get()
+            filtered = filter_states_for_current_user(cached_states, gpu_procs, _p2l)
+            if not filtered:
+                if not warned_empty:
+                    print(f"kempnerpulse: no GPU compute processes found for user "
+                          f"'{current_user}' on {len(cached_states)} visible GPU(s). "
+                          "Will emit rows when processes appear.", file=sys.stderr)
+                    warned_empty = True
+                return
+            warned_empty = False
+            timestamp = time.time()
             try:
-                while True:
-                    time.sleep(args.poll)
-                    fetch_data()
-                    gpu_procs = query_gpu_processes(bus_id_map)
-                    filtered = filter_states_for_current_user(cached_states, gpu_procs, _p2l)
-                    if not filtered and not warned_empty:
-                        print(f"kempnerpulse: no GPU compute processes found for user '{current_user}'. "
-                              "Will emit rows when processes appear.", file=sys.stderr)
-                        warned_empty = True
-                    timestamp = time.time()
-                    for state in filtered:
-                        writer.writerow(export_gpu_row(state, timestamp, export_cols))
-                    sys.stdout.flush()
-            except KeyboardInterrupt:
-                pass
+                for state in filtered:
+                    writer.writerow(export_gpu_row(state, timestamp, export_cols))
+                sys.stdout.flush()
             except BrokenPipeError:
-                try:
-                    sys.stdout.close()
-                except BrokenPipeError:
-                    pass
+                raise
+
+        try:
+            emit_rows()
+            if not args.once:
+                if use_dcgm_backend and reader is not None:
+                    # Streaming path: block on the reader's sample counter so we
+                    # emit exactly once per new dcgmi tick (the reader paces at
+                    # poll_ms; no time.sleep needed).
+                    last_counter = reader.last_counter()
+                    while True:
+                        latest, _prev, new_counter = reader.wait_for_new(
+                            last_counter, timeout=max(args.poll * 5.0, 2.0)
+                        )
+                        if latest is None:
+                            # Reader stopped or errored — exit cleanly.
+                            break
+                        last_counter = new_counter
+                        fetch_data()
+                        emit_rows()
+                else:
+                    while True:
+                        time.sleep(args.poll)
+                        fetch_data()
+                        emit_rows()
+        except KeyboardInterrupt:
+            pass
+        except BrokenPipeError:
+            try:
+                sys.stdout.close()
+            except BrokenPipeError:
+                pass
         return 0
 
     if args.once:
