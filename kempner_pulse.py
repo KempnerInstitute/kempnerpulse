@@ -1891,7 +1891,7 @@ def summary_panel(
         Text(f"RAM\n{ram_text}", style=usage_style(ram_pct)),
         Text(f"Health\n{critical} warn/crit", style="bold red" if critical else "green"),
     )
-    return Panel(grid, title=APP_NAME, border_style="cyan", box=box.ROUNDED)
+    return Panel(grid, title=f"{APP_NAME} (v{__version__})", border_style="cyan", box=box.ROUNDED)
 
 
 # ── Fleet View (GPU cards) ───────────────────────────────────────────────────
