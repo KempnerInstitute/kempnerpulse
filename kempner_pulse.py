@@ -2756,6 +2756,57 @@ def main() -> int:
         pcie_bw_limits = {local_to_phys.get(k, k): v for k, v in pcie_bw_limits.items()}
         nvlink_bw_limits = {local_to_phys.get(k, k): v for k, v in nvlink_bw_limits.items()}
 
+    # --poll validation / backend-specific handling
+    if use_dcgm_backend:
+        poll_ms = max(DCGM_STREAM_MIN_INTERVAL_MS, int(round(args.poll * 1000)))
+        if int(round(args.poll * 1000)) < DCGM_STREAM_MIN_INTERVAL_MS:
+            print(f"kempnerpulse: --poll {args.poll}s is below the dcgm profiling floor; "
+                  f"clamping to {DCGM_STREAM_MIN_INTERVAL_MS}ms.", file=sys.stderr)
+    else:
+        poll_ms = int(round(args.poll * 1000))
+        if args.poll < 1.0:
+            # Prometheus backend: dcgm-exporter's scrape interval (~30s for profiling
+            # fields) sets the true ceiling. Sub-second --poll values produce
+            # duplicate samples with no new data.
+            console.print(
+                f"[bold yellow]Warning:[/] --poll {args.poll}s is below the Prometheus "
+                f"backend's effective sampling rate.\n"
+                f"[dim]dcgm-exporter scrapes DCGM at ~30s for profiling fields, so "
+                f"sub-second --poll values produce duplicate samples with no new data.[/]\n"
+                f"Options:\n"
+                f"  • Use [bold]--backend dcgm[/] for true high-resolution sampling (down to 100ms)\n"
+                f"  • Raise [bold]--poll[/] to >= 1.0 on the prometheus backend"
+            )
+            return 1
+
+    # Start streaming reader for the dcgm backend (not needed for --once, which
+    # uses the synchronous load_dcgm_direct path).
+    reader: Optional[DcgmStreamReader] = None
+    if use_dcgm_backend and not args.once:
+        reader = DcgmStreamReader(
+            gpu_ids=dcgm_physical_gpu_ids,
+            poll_ms=poll_ms,
+            gpu_models=gpu_models,
+        )
+        try:
+            reader.start()
+        except DcgmStreamError as exc:
+            console.print(f"[bold red]dcgmi stream failed to start: {exc}[/]")
+            return 1
+        atexit.register(reader.stop)
+        # SIGTERM's default action bypasses atexit; redirect to a clean exit so
+        # the reader subprocess is reaped and the terminal is restored.
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        try:
+            if not reader.wait_first_sample(timeout=5.0):
+                console.print("[bold red]Timed out waiting for the first dcgmi sample.[/]")
+                reader.stop()
+                return 1
+        except DcgmStreamError as exc:
+            console.print(f"[bold red]dcgmi stream error: {exc}[/]")
+            reader.stop()
+            return 1
+
     current_visible_ids: Set[str] = set()
     cached_states: List[DerivedGPUState] = []
     cached_gpu_procs: Dict[str, List[GpuProcess]] = {}
@@ -2765,21 +2816,35 @@ def main() -> int:
     def fetch_data() -> None:
         nonlocal prev, current_visible_ids, cached_states, cached_gpu_procs
         nonlocal cached_cpu_info, cached_ram_info
+        sample: Optional[Sample] = None
+        filtered_prev: Optional[Sample] = None
         try:
-            if use_dcgm_backend:
+            if use_dcgm_backend and reader is not None:
+                # Streaming path: the reader thread owns the rolling (latest, prev) pair.
+                stream_latest, stream_prev = reader.get_pair()
+                if stream_latest is None:
+                    return
+                sample = stream_latest
+                filtered_prev = filter_sample_to_gpu_ids(stream_prev, allowed_gpu_ids) if stream_prev is not None else None
+            elif use_dcgm_backend:
+                # --once path: keep the synchronous one-shot invocation.
                 raw = load_dcgm_direct(gpu_ids=dcgm_physical_gpu_ids)
                 sample = parse_dcgm_dmon(raw, gpu_models)
+                filtered_prev = filter_sample_to_gpu_ids(prev, allowed_gpu_ids) if prev is not None else None
             else:
                 raw = load_source(args.source)
                 sample = parse_prometheus_text(raw)
+                filtered_prev = filter_sample_to_gpu_ids(prev, allowed_gpu_ids) if prev is not None else None
         except Exception as exc:
             print(f"kempnerpulse: data fetch failed: {exc}", file=sys.stderr)
             return
         filtered_sample = filter_sample_to_gpu_ids(sample, allowed_gpu_ids)
-        filtered_prev = filter_sample_to_gpu_ids(prev, allowed_gpu_ids) if prev is not None else None
         cached_states = build_gpu_states(filtered_sample, filtered_prev, args.weights, gpu_models)
         update_history(history, cached_states)
-        prev = sample
+        # For dcgm streaming, the reader owns `prev`. For prometheus and --once,
+        # we continue to track it locally for delta computation.
+        if not (use_dcgm_backend and reader is not None):
+            prev = sample
         current_visible_ids = {s.gpu_id for s in cached_states}
         cached_gpu_procs = query_gpu_processes(bus_id_map) if controller.jobs_mode else {}
         cached_cpu_info = query_system_cpu()
