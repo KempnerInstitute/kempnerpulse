@@ -141,7 +141,7 @@ kempnerpulse --export --once
 | `--version` | | | Show version and exit. |
 | `--backend` | string | `prometheus` | Data source backend: `prometheus` (dcgm-exporter HTTP) or `dcgm` (dcgmi dmon direct). |
 | `--source URL` | string | `http://localhost:9400/metrics` | dcgm-exporter `/metrics` endpoint or a local text file (prometheus backend only). |
-| `--poll SECS` | float | `1.0` | Dashboard redraw interval in seconds (does not change DCGM sampling rate). |
+| `--poll SECS` | float | `1.0` | Sampling/refresh interval in seconds. With `--backend dcgm`, drives a persistent `dcgmi` stream and is honored down to a 100ms floor (DCGM profiling counters refresh at ~10Hz internally; below 100ms most profiling rows would be blank). With `--backend prometheus`, must be `>= 1.0` (dcgm-exporter scrapes profiling fields at ~30s, so sub-second values just duplicate samples). |
 | `--history N` | int | `120` | Number of samples kept for sparkline history. |
 | `--focus-gpu ID` | string | | Start in Focus View for the given GPU id (e.g. `0`). |
 | `--once` | flag | | Render a single snapshot and exit instead of running live. |
@@ -151,7 +151,7 @@ kempnerpulse --export --once
 | `--ai-weights` | preset | | AI/LLM training preset `(0.35, 0.35, 0.20, 0.10)`. This is the default. |
 | `--hpc-weights` | preset | | HPC / mixed CUDA preset `(0.45, 0.15, 0.25, 0.15)`. |
 | `--mem-weights` | preset | | Memory-bound / bandwidth-heavy preset `(0.35, 0.10, 0.40, 0.15)`. |
-| `--export` | string | *(off)* | Output CSV to stdout. `--export` for default columns, `--export all` for every column, or `--export col1,col2,...` for a custom set. Only GPUs with processes owned by the current user are included. |
+| `--export` | string | *(off)* | Output CSV to stdout. `--export` for default columns, `--export all` for every column, or `--export col1,col2,...` for a custom set. Rows are emitted for every GPU in the visibility set (`CUDA_VISIBLE_DEVICES` / `SLURM_JOB_GPUS` / `--gpus`), so you can start the recorder before your job launches. |
 
 ### GPU Visibility Selection
 

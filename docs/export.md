@@ -1,8 +1,10 @@
 # CSV Export Reference
 
 KempnerPulse can export GPU metrics as CSV for offline analysis or terminal
-monitoring. Only GPUs where the current user has running compute processes are
-included (same ownership detection as Job View).
+monitoring. Rows are emitted for every GPU in the visibility set
+(`CUDA_VISIBLE_DEVICES` / `SLURM_JOB_GPUS` / `--gpus` / `--show-all`),
+regardless of whether a compute process is currently running. This lets you
+start the recorder before a job launches so the trace covers job startup.
 
 ## Usage
 
@@ -21,7 +23,27 @@ kempnerpulse --export --once
 
 # Combine with other flags
 kempnerpulse --export all --poll 5 --gpus 0,1 > metrics.csv
+
+# High-resolution sampling via the dcgm backend (down to 100ms)
+kempnerpulse --backend dcgm --export all --poll 0.1 > metrics.csv
 ```
+
+## Sampling Rate (`--poll`)
+
+`--poll` semantics depend on the backend:
+
+| Backend | Effective range | Notes |
+|---------|----------------|-------|
+| `dcgm` (recommended for export) | `0.1s` – any | Drives a persistent `dcgmi dmon` stream at the requested interval. Values below 100ms are clamped with a notice — DCGM's profiling counters (`DCGM_FI_PROF_*`, i.e. SM/Tensor/DRAM Active and friends) refresh at ~10Hz via the shared hardware-counter multiplexer, so smaller intervals just produce blank profiling rows. One CSV row-set is emitted per dcgmi tick — no spawned subprocess per cycle, no skew. |
+| `prometheus` (default) | `>= 1.0s` | dcgm-exporter scrapes profiling fields at ~30s, so sub-second `--poll` values produce duplicate rows with no new data. Sub-second values are rejected with a warning. |
+
+For high-resolution profiling traces (e.g., capturing tensor activity at
+100ms resolution to plot offline), use `--backend dcgm --poll 0.1`. Note
+that only the profiling columns are bounded by the 10Hz internal
+refresh; device columns (clocks, temps, power, framebuffer) are sampled
+every tick and would update faster if the floor were lowered — but we
+keep the floor at 100ms because Real Util and the workload
+classification depend on the profiling counters.
 
 ## Default Columns
 

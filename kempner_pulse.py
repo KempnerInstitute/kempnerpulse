@@ -11,13 +11,16 @@ if sys.version_info < (3, 9):
     sys.exit("KempnerPulse requires Python 3.9 or later.")
 
 import argparse
+import atexit
 import csv
 import grp
 import math
 import os
 import pwd
 import re
+import signal
 import socket
+import threading
 import time
 import subprocess
 import urllib.request
@@ -101,7 +104,42 @@ DCGM_DMON_METRIC_NAMES = [name for _, name in DCGM_DMON_FIELDS]
 
 SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 APP_NAME = "KempnerPulse GPU Dashboard"
-__version__ = "0.3.0"
+
+
+def _read_version() -> str:
+    """Return the package version, sourced from pyproject.toml.
+
+    ``pyproject.toml`` is the single source of truth. At runtime we resolve
+    it via (in order):
+      1. Installed-package metadata (``pip install`` / ``pipx install``),
+         which is generated from ``pyproject.toml`` at build time.
+      2. For source checkouts where the package isn't installed, a regex
+         scan of ``pyproject.toml`` sitting next to this script.
+      3. ``"unknown"`` if neither is available (e.g., the .py was copied
+         out of its source tree without pyproject).
+    """
+    try:
+        from importlib.metadata import version as _v, PackageNotFoundError
+        try:
+            return _v("kempnerpulse")
+        except PackageNotFoundError:
+            pass
+    except ImportError:
+        pass
+    try:
+        pyproject = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "pyproject.toml")
+        with open(pyproject, "r", encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r'^\s*version\s*=\s*"([^"]+)"', line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return "unknown"
+
+
+__version__ = _read_version()
 
 EXPORT_DEFAULT_COLUMNS = (
     "timestamp", "gpu_id", "model", "gpu_util_pct", "mem_used_mib",
@@ -655,6 +693,294 @@ def parse_dcgm_dmon(text: str, gpu_models: Optional[Dict[str, str]] = None) -> S
             labels[gpu_id]["modelName"] = gpu_models[gpu_id]
 
     return Sample(ts=time.time(), metrics=dict(metrics), labels=dict(labels))
+
+
+# ── Streaming DCGM reader ────────────────────────────────────────────────────
+#
+# One persistent ``dcgmi dmon -c 0 -d <poll_ms>`` subprocess feeds both the TUI
+# and the CSV export writer. A reader thread parses each tick block into a
+# ``Sample`` and publishes the latest pair (current + previous) under a
+# condition variable so consumers can either poll (TUI) or block until a new
+# sample arrives (export).
+#
+# Tick boundary detection (empirically verified on H200):
+#   * dcgmi emits no blank lines between ticks.
+#   * The ``#Entity`` header is printed once at start and again every ~15 data
+#     rows. Header and ``ID`` lines are ignored.
+#   * A tick ends when we see a ``GPU <id>`` whose ``<id>`` is already present
+#     in the current buffer — so we flush the buffer and start a new one with
+#     the repeating line.
+#   * The first tick is dropped: profiling fields return N/A on the very first
+#     sample of a cold dcgmi process.
+
+# DCGM profiling counters (DCGM_FI_PROF_*) refresh at ~10Hz via the shared
+# hardware-counter multiplexer. Probing on H200 confirmed -d 100ms gives 0% N/A
+# rows; -d 50 alternates full/blank (44% N/A); -d 20 and below plateau at ~80%
+# N/A. Device fields (clocks/temps/power) do refresh faster, but the tool's
+# Real Util signal depends on profiling, so we clamp the streaming interval.
+DCGM_STREAM_MIN_INTERVAL_MS = 100
+
+
+def fmt_duration(seconds: float, *, signed: bool = False) -> str:
+    """Compact duration label that picks units to keep the number readable.
+
+    Used by the footer's ``poll=`` indicator (always a positive value —
+    non-positive ``--poll`` is rejected at CLI parse time) and by the
+    line-plot x-axis tick labels. The ``signed=True`` path is *internal*
+    to the x-axis, which renders negative offsets relative to "now" at
+    the right edge (e.g. ``-50ms``, ``-1.5s``).
+
+    Examples:
+        fmt_duration(1.0)    -> "1s"
+        fmt_duration(0.5)    -> "500ms"
+        fmt_duration(0.05)   -> "50ms"
+        fmt_duration(0.001)  -> "1ms"
+        fmt_duration(0.0)    -> "0s"
+        fmt_duration(-0.05, signed=True) -> "-50ms"   # plot x-axis tick
+    """
+    if seconds == 0:
+        return "0s"
+    sign = "-" if (signed and seconds < 0) else ""
+    val = abs(seconds)
+    if val >= 1.0:
+        # 1.5s, 30s, 600s — drop the decimal once we're past 10s.
+        if val >= 10:
+            return f"{sign}{val:.0f}s"
+        return f"{sign}{val:.1f}s".replace(".0s", "s")
+    ms = val * 1000.0
+    if ms >= 1.0:
+        if ms >= 10:
+            return f"{sign}{ms:.0f}ms"
+        return f"{sign}{ms:.1f}ms".replace(".0ms", "ms")
+    # Sub-millisecond: round up to 1ms rather than printing "0ms".
+    return f"{sign}1ms"
+
+
+class DcgmStreamError(RuntimeError):
+    """Raised when the dcgmi streaming subprocess fails or exits unexpectedly."""
+
+
+class DcgmStreamReader:
+    """Background reader around a persistent ``dcgmi dmon -c 0`` subprocess."""
+
+    def __init__(self,
+                 gpu_ids: Optional[List[str]],
+                 poll_ms: int,
+                 gpu_models: Optional[Dict[str, str]] = None):
+        self._gpu_ids = gpu_ids
+        self._poll_ms = max(DCGM_STREAM_MIN_INTERVAL_MS, int(poll_ms))
+        self._gpu_models = gpu_models or {}
+        self._proc: Optional[subprocess.Popen] = None
+        self._reader_thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._cond = threading.Condition()
+        self._stop = threading.Event()
+        self._latest: Optional[Sample] = None
+        self._prev: Optional[Sample] = None
+        self._counter: int = 0
+        self._skipped_first: bool = False
+        self._error: Optional[BaseException] = None
+        self._started = False
+
+    # ── lifecycle ───────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        if self._started:
+            return
+        cmd = ["dcgmi", "dmon", "-c", "0", "-d", str(self._poll_ms),
+               "-e", DCGM_DMON_FIELD_IDS]
+        if self._gpu_ids:
+            cmd.extend(["-i", ",".join(f"gpu:{gid}" for gid in self._gpu_ids)])
+        # Stripping CUDA_VISIBLE_DEVICES suppresses dcgmi's multi-line stdout
+        # warning preamble; dcgmi targets the hostengine, not CUDA, so the
+        # variable has no functional effect on which GPUs it reports.
+        env = {k: v for k, v in os.environ.items() if k != "CUDA_VISIBLE_DEVICES"}
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+                env=env,
+            )
+        except FileNotFoundError as exc:
+            raise DcgmStreamError(f"dcgmi not found: {exc}") from exc
+
+        self._reader_thread = threading.Thread(
+            target=self._read_stdout, name="dcgm-stream", daemon=True,
+        )
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, name="dcgm-stream-err", daemon=True,
+        )
+        self._reader_thread.start()
+        self._stderr_thread.start()
+        self._started = True
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        self._stop.set()
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+        # Wake any blocked consumers
+        with self._cond:
+            self._cond.notify_all()
+        for t in (self._reader_thread, self._stderr_thread):
+            if t is not None and t.is_alive():
+                t.join(timeout=1.0)
+        self._started = False
+
+    # ── consumer APIs ───────────────────────────────────────────────────
+
+    def get_pair(self) -> Tuple[Optional[Sample], Optional[Sample]]:
+        """Non-blocking snapshot of (latest, prev). Used by the TUI."""
+        with self._cond:
+            if self._error is not None and self._latest is None:
+                raise DcgmStreamError(str(self._error))
+            return self._latest, self._prev
+
+    def last_counter(self) -> int:
+        """Current value of the sample counter (for pairing with wait_for_new)."""
+        with self._cond:
+            return self._counter
+
+    def wait_for_new(self,
+                     last_counter: int,
+                     timeout: float = 2.0,
+                     ) -> Tuple[Optional[Sample], Optional[Sample], int]:
+        """Block until the sample counter advances past ``last_counter``.
+
+        Returns (latest, prev, new_counter). If the reader has stopped or
+        errored before a new sample arrives, returns (None, None, last_counter).
+        """
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._counter <= last_counter and not self._stop.is_set() and self._error is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cond.wait(timeout=remaining)
+            if self._error is not None and self._latest is None:
+                raise DcgmStreamError(str(self._error))
+            if self._stop.is_set() and self._counter <= last_counter:
+                return None, None, last_counter
+            return self._latest, self._prev, self._counter
+
+    def wait_first_sample(self, timeout: float = 5.0) -> bool:
+        """Block until the first valid sample is published. Returns True on success."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._counter == 0 and not self._stop.is_set() and self._error is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(timeout=remaining)
+            if self._error is not None:
+                raise DcgmStreamError(str(self._error))
+            return self._counter > 0
+
+    # ── internal: stdout reader ─────────────────────────────────────────
+
+    def _read_stdout(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        current: Dict[str, List[str]] = {}  # gpu_id -> full line (most recent wins)
+        order: List[str] = []                # gpu_id order in current tick
+
+        try:
+            for raw_line in proc.stdout:
+                if self._stop.is_set():
+                    break
+                line = raw_line.rstrip("\n")
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                # Skip header lines and any dcgmi preamble that isn't a GPU data row
+                if stripped.startswith("#") or stripped.startswith("ID"):
+                    continue
+                parts = stripped.split()
+                if len(parts) < 2 or parts[0] != "GPU":
+                    continue
+                gpu_id = parts[1]
+                if gpu_id in current:
+                    # Boundary: this id already has a row → flush and start new tick
+                    self._publish(current, order)
+                    current = {}
+                    order = []
+                current[gpu_id] = line
+                order.append(gpu_id)
+            # stdout closed → subprocess exited
+            rc = proc.poll()
+            if rc is not None and rc != 0 and not self._stop.is_set():
+                stderr_tail = ""
+                if proc.stderr is not None:
+                    try:
+                        stderr_tail = proc.stderr.read() or ""
+                    except Exception:
+                        pass
+                self._set_error(DcgmStreamError(
+                    f"dcgmi dmon exited with code {rc}: {stderr_tail.strip()}"
+                ))
+        except Exception as exc:
+            self._set_error(exc)
+        finally:
+            # Wake any blocked consumers on shutdown/error
+            with self._cond:
+                self._cond.notify_all()
+
+    def _publish(self, current: Dict[str, List[str]], order: List[str]) -> None:
+        if not current:
+            return
+        # Reassemble block text in original order, then parse once
+        block_text = "\n".join(current[gid] for gid in order)
+        sample = parse_dcgm_dmon(block_text, self._gpu_models)
+        if not self._skipped_first:
+            # Drop the first tick — profiling fields often N/A on cold dcgmi start
+            self._skipped_first = True
+            return
+        with self._cond:
+            self._prev = self._latest
+            self._latest = sample
+            self._counter += 1
+            self._cond.notify_all()
+
+    # ── internal: stderr drain ──────────────────────────────────────────
+
+    def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            for line in proc.stderr:
+                if self._stop.is_set():
+                    break
+                if line.strip():
+                    sys.stderr.write(f"[dcgmi] {line}")
+                    sys.stderr.flush()
+        except Exception:
+            pass
+
+    # ── internal: error ─────────────────────────────────────────────────
+
+    def _set_error(self, exc: BaseException) -> None:
+        with self._cond:
+            if self._error is None:
+                self._error = exc
+            self._cond.notify_all()
 
 
 # ── nvidia-smi hardware queries ──────────────────────────────────────────────
@@ -1417,29 +1743,6 @@ def export_gpu_row(state: DerivedGPUState, timestamp: float,
     return row
 
 
-def filter_states_for_current_user(
-    states: List[DerivedGPUState],
-    gpu_processes: Dict[str, List[GpuProcess]],
-    phys_to_local: Optional[Dict[str, str]] = None,
-) -> List[DerivedGPUState]:
-    """Keep only GPUs where the current user has at least one running compute process.
-
-    phys_to_local: when using the dcgm backend inside a SLURM cgroup, state gpu_ids
-    are physical (from dcgmi) while gpu_processes keys are local (from nvidia-smi).
-    This map bridges the two so the filter can match correctly.
-    """
-    current_user = pwd.getpwuid(os.getuid()).pw_name
-    user_gpu_ids: Set[str] = set()
-    for gpu_id, procs in gpu_processes.items():
-        for p in procs:
-            if p.user == current_user:
-                user_gpu_ids.add(gpu_id)
-                break
-    if phys_to_local:
-        return [s for s in states if phys_to_local.get(s.gpu_id, s.gpu_id) in user_gpu_ids]
-    return [s for s in states if s.gpu_id in user_gpu_ids]
-
-
 # ── System metrics ───────────────────────────────────────────────────────────
 
 def query_system_cpu() -> Tuple[Optional[int], Optional[int], Optional[float], Optional[int]]:
@@ -1587,7 +1890,7 @@ def summary_panel(
         Text(f"RAM\n{ram_text}", style=usage_style(ram_pct)),
         Text(f"Health\n{critical} warn/crit", style="bold red" if critical else "green"),
     )
-    return Panel(grid, title=APP_NAME, border_style="cyan", box=box.ROUNDED)
+    return Panel(grid, title=f"{APP_NAME} (v{__version__})", border_style="cyan", box=box.ROUNDED)
 
 
 # ── Fleet View (GPU cards) ───────────────────────────────────────────────────
@@ -1834,7 +2137,7 @@ class LinePlotRenderable:
                 frac = i / n_ticks
                 col = int(frac * (chart_cols - 1))
                 secs = total_s * (1.0 - frac)
-                label = f"-{secs:.0f}s" if secs > 0 else "0s"
+                label = fmt_duration(-secs, signed=True) if secs > 0 else "0s"
                 # Place label starting at col, but don't overflow
                 start = max(0, min(col, chart_cols - len(label)))
                 for j, ch in enumerate(label):
@@ -2166,7 +2469,7 @@ def footer_panel(selection_desc: str, controller: CommandController, source: str
     )
     left.no_wrap = True
     left.overflow = "ellipsis"
-    right_plain = f"host={hostname}  src={display_source}  poll={poll:.1f}s  {now_str}"
+    right_plain = f"host={hostname}  src={display_source}  poll={fmt_duration(poll)}  {now_str}"
     right = Text(right_plain, style="dim", no_wrap=True)
     right_w = len(right_plain)
     line = Table.grid(expand=True)
@@ -2401,7 +2704,7 @@ def main() -> int:
                         help="Metric collection backend. 'prometheus' reads from dcgm-exporter HTTP endpoint "
                              "(~30s resolution for profiling fields). 'dcgm' queries dcgmi dmon directly for "
                              "true high-resolution sampling (down to 100ms). Default: prometheus")
-    parser.add_argument("--poll", type=float, default=1.0, help="UI refresh interval in seconds. This redraws the dashboard; it does not force DCGM itself to sample faster. Default: 1.0")
+    parser.add_argument("--poll", type=float, default=1.0, help="Sampling/refresh interval in seconds. With --backend dcgm, drives a persistent dcgmi stream and is honored down to a 100ms floor (DCGM profiling counters refresh at ~10Hz internally; smaller values would yield blank profiling rows). With --backend prometheus, must be >= 1.0 (dcgm-exporter scrapes profiling fields at ~30s, so sub-second values just duplicate samples). Default: 1.0")
     parser.add_argument("--history", type=int, default=120, help="Number of samples kept for sparkline history. Default: 120")
     parser.add_argument("--focus-gpu", default=None, help="Start in focused view for one GPU id, for example 0")
     parser.add_argument("--once", action="store_true", help="Render one snapshot and exit instead of running live")
@@ -2489,6 +2792,69 @@ def main() -> int:
         pcie_bw_limits = {local_to_phys.get(k, k): v for k, v in pcie_bw_limits.items()}
         nvlink_bw_limits = {local_to_phys.get(k, k): v for k, v in nvlink_bw_limits.items()}
 
+    # --poll validation / backend-specific handling
+    if args.poll <= 0:
+        console.print(
+            f"[bold red]Error:[/] --poll must be a positive number of seconds "
+            f"(got {args.poll}). Use e.g. --poll 0.1 for 100ms or --poll 2 for 2s."
+        )
+        return 1
+
+    if use_dcgm_backend:
+        poll_ms = max(DCGM_STREAM_MIN_INTERVAL_MS, int(round(args.poll * 1000)))
+        if int(round(args.poll * 1000)) < DCGM_STREAM_MIN_INTERVAL_MS:
+            print(
+                f"kempnerpulse: note — DCGM profiling counters "
+                f"(SM/Tensor/DRAM Active, etc.) refresh at ~10Hz internally; "
+                f"--poll {args.poll}s would yield mostly-blank profiling rows. "
+                f"Clamping to {DCGM_STREAM_MIN_INTERVAL_MS}ms.",
+                file=sys.stderr,
+            )
+    else:
+        poll_ms = int(round(args.poll * 1000))
+        if args.poll < 1.0:
+            # Prometheus backend: dcgm-exporter's scrape interval (~30s for profiling
+            # fields) sets the true ceiling. Sub-second --poll values produce
+            # duplicate samples with no new data.
+            console.print(
+                f"[bold yellow]Warning:[/] --poll {args.poll}s is below the Prometheus "
+                f"backend's effective sampling rate.\n"
+                f"[dim]dcgm-exporter scrapes DCGM at ~30s for profiling fields, so "
+                f"sub-second --poll values produce duplicate samples with no new data.[/]\n"
+                f"Options:\n"
+                f"  • Use [bold]--backend dcgm[/] for true high-resolution sampling (down to 100ms)\n"
+                f"  • Raise [bold]--poll[/] to >= 1.0 on the prometheus backend"
+            )
+            return 1
+
+    # Start streaming reader for the dcgm backend (not needed for --once, which
+    # uses the synchronous load_dcgm_direct path).
+    reader: Optional[DcgmStreamReader] = None
+    if use_dcgm_backend and not args.once:
+        reader = DcgmStreamReader(
+            gpu_ids=dcgm_physical_gpu_ids,
+            poll_ms=poll_ms,
+            gpu_models=gpu_models,
+        )
+        try:
+            reader.start()
+        except DcgmStreamError as exc:
+            console.print(f"[bold red]dcgmi stream failed to start: {exc}[/]")
+            return 1
+        atexit.register(reader.stop)
+        # SIGTERM's default action bypasses atexit; redirect to a clean exit so
+        # the reader subprocess is reaped and the terminal is restored.
+        signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+        try:
+            if not reader.wait_first_sample(timeout=5.0):
+                console.print("[bold red]Timed out waiting for the first dcgmi sample.[/]")
+                reader.stop()
+                return 1
+        except DcgmStreamError as exc:
+            console.print(f"[bold red]dcgmi stream error: {exc}[/]")
+            reader.stop()
+            return 1
+
     current_visible_ids: Set[str] = set()
     cached_states: List[DerivedGPUState] = []
     cached_gpu_procs: Dict[str, List[GpuProcess]] = {}
@@ -2498,21 +2864,35 @@ def main() -> int:
     def fetch_data() -> None:
         nonlocal prev, current_visible_ids, cached_states, cached_gpu_procs
         nonlocal cached_cpu_info, cached_ram_info
+        sample: Optional[Sample] = None
+        filtered_prev: Optional[Sample] = None
         try:
-            if use_dcgm_backend:
+            if use_dcgm_backend and reader is not None:
+                # Streaming path: the reader thread owns the rolling (latest, prev) pair.
+                stream_latest, stream_prev = reader.get_pair()
+                if stream_latest is None:
+                    return
+                sample = stream_latest
+                filtered_prev = filter_sample_to_gpu_ids(stream_prev, allowed_gpu_ids) if stream_prev is not None else None
+            elif use_dcgm_backend:
+                # --once path: keep the synchronous one-shot invocation.
                 raw = load_dcgm_direct(gpu_ids=dcgm_physical_gpu_ids)
                 sample = parse_dcgm_dmon(raw, gpu_models)
+                filtered_prev = filter_sample_to_gpu_ids(prev, allowed_gpu_ids) if prev is not None else None
             else:
                 raw = load_source(args.source)
                 sample = parse_prometheus_text(raw)
+                filtered_prev = filter_sample_to_gpu_ids(prev, allowed_gpu_ids) if prev is not None else None
         except Exception as exc:
             print(f"kempnerpulse: data fetch failed: {exc}", file=sys.stderr)
             return
         filtered_sample = filter_sample_to_gpu_ids(sample, allowed_gpu_ids)
-        filtered_prev = filter_sample_to_gpu_ids(prev, allowed_gpu_ids) if prev is not None else None
         cached_states = build_gpu_states(filtered_sample, filtered_prev, args.weights, gpu_models)
         update_history(history, cached_states)
-        prev = sample
+        # For dcgm streaming, the reader owns `prev`. For prometheus and --once,
+        # we continue to track it locally for delta computation.
+        if not (use_dcgm_backend and reader is not None):
+            prev = sample
         current_visible_ids = {s.gpu_id for s in cached_states}
         cached_gpu_procs = query_gpu_processes(bus_id_map) if controller.jobs_mode else {}
         cached_cpu_info = query_system_cpu()
@@ -2550,41 +2930,59 @@ def main() -> int:
         writer.writerow([col for col, _ in export_cols])
         sys.stdout.flush()
 
-        current_user = pwd.getpwuid(os.getuid()).pw_name
-        gpu_procs = query_gpu_processes(bus_id_map)
-        _p2l = dcgm_phys_to_local if use_dcgm_backend else None
-        filtered = filter_states_for_current_user(cached_states, gpu_procs, _p2l)
-        if not filtered:
-            print(f"kempnerpulse: no GPU compute processes found for user '{current_user}' "
-                  f"on {len(cached_states)} visible GPU(s). Waiting...", file=sys.stderr)
-        timestamp = time.time()
-        for state in filtered:
-            writer.writerow(export_gpu_row(state, timestamp, export_cols))
-        sys.stdout.flush()
+        # Export emits rows for every GPU in the visibility set
+        # (CUDA_VISIBLE_DEVICES / SLURM_JOB_GPUS / --gpus). No ownership
+        # filter: the user can launch the recorder before their job starts
+        # so the trace covers job startup.
+        warned_empty = False
 
-        if not args.once:
-            warned_empty = not filtered  # already warned above on first batch
+        def emit_rows() -> None:
+            nonlocal warned_empty
+            if not cached_states:
+                if not warned_empty:
+                    print("kempnerpulse: no visible GPUs in the data source yet. "
+                          "Will emit rows when they appear.", file=sys.stderr)
+                    warned_empty = True
+                return
+            warned_empty = False
+            timestamp = time.time()
             try:
-                while True:
-                    time.sleep(args.poll)
-                    fetch_data()
-                    gpu_procs = query_gpu_processes(bus_id_map)
-                    filtered = filter_states_for_current_user(cached_states, gpu_procs, _p2l)
-                    if not filtered and not warned_empty:
-                        print(f"kempnerpulse: no GPU compute processes found for user '{current_user}'. "
-                              "Will emit rows when processes appear.", file=sys.stderr)
-                        warned_empty = True
-                    timestamp = time.time()
-                    for state in filtered:
-                        writer.writerow(export_gpu_row(state, timestamp, export_cols))
-                    sys.stdout.flush()
-            except KeyboardInterrupt:
-                pass
+                for state in cached_states:
+                    writer.writerow(export_gpu_row(state, timestamp, export_cols))
+                sys.stdout.flush()
             except BrokenPipeError:
-                try:
-                    sys.stdout.close()
-                except BrokenPipeError:
-                    pass
+                raise
+
+        try:
+            emit_rows()
+            if not args.once:
+                if use_dcgm_backend and reader is not None:
+                    # Streaming path: block on the reader's sample counter so we
+                    # emit exactly once per new dcgmi tick (the reader paces at
+                    # poll_ms; no time.sleep needed).
+                    last_counter = reader.last_counter()
+                    while True:
+                        latest, _prev, new_counter = reader.wait_for_new(
+                            last_counter, timeout=max(args.poll * 5.0, 2.0)
+                        )
+                        if latest is None:
+                            # Reader stopped or errored — exit cleanly.
+                            break
+                        last_counter = new_counter
+                        fetch_data()
+                        emit_rows()
+                else:
+                    while True:
+                        time.sleep(args.poll)
+                        fetch_data()
+                        emit_rows()
+        except KeyboardInterrupt:
+            pass
+        except BrokenPipeError:
+            try:
+                sys.stdout.close()
+            except BrokenPipeError:
+                pass
         return 0
 
     if args.once:
