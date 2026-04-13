@@ -689,8 +689,11 @@ DCGM_STREAM_MIN_INTERVAL_MS = 100
 def fmt_duration(seconds: float, *, signed: bool = False) -> str:
     """Compact duration label that picks units to keep the number readable.
 
-    Used by the footer's ``poll=`` indicator and the line-plot x-axis so that
-    sub-second values do not all collapse to ``0s``.
+    Used by the footer's ``poll=`` indicator (always a positive value —
+    non-positive ``--poll`` is rejected at CLI parse time) and by the
+    line-plot x-axis tick labels. The ``signed=True`` path is *internal*
+    to the x-axis, which renders negative offsets relative to "now" at
+    the right edge (e.g. ``-50ms``, ``-1.5s``).
 
     Examples:
         fmt_duration(1.0)    -> "1s"
@@ -698,7 +701,7 @@ def fmt_duration(seconds: float, *, signed: bool = False) -> str:
         fmt_duration(0.05)   -> "50ms"
         fmt_duration(0.001)  -> "1ms"
         fmt_duration(0.0)    -> "0s"
-        fmt_duration(-2.5, signed=True) -> "-2.5s"
+        fmt_duration(-0.05, signed=True) -> "-50ms"   # plot x-axis tick
     """
     if seconds == 0:
         return "0s"
@@ -2755,6 +2758,13 @@ def main() -> int:
         nvlink_bw_limits = {local_to_phys.get(k, k): v for k, v in nvlink_bw_limits.items()}
 
     # --poll validation / backend-specific handling
+    if args.poll <= 0:
+        console.print(
+            f"[bold red]Error:[/] --poll must be a positive number of seconds "
+            f"(got {args.poll}). Use e.g. --poll 0.1 for 100ms or --poll 2 for 2s."
+        )
+        return 1
+
     if use_dcgm_backend:
         poll_ms = max(DCGM_STREAM_MIN_INTERVAL_MS, int(round(args.poll * 1000)))
         if int(round(args.poll * 1000)) < DCGM_STREAM_MIN_INTERVAL_MS:
