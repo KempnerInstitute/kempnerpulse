@@ -104,7 +104,42 @@ DCGM_DMON_METRIC_NAMES = [name for _, name in DCGM_DMON_FIELDS]
 
 SPARK_BLOCKS = "▁▂▃▄▅▆▇█"
 APP_NAME = "KempnerPulse GPU Dashboard"
-__version__ = "0.4.0"
+
+
+def _read_version() -> str:
+    """Return the package version, sourced from pyproject.toml.
+
+    ``pyproject.toml`` is the single source of truth. At runtime we resolve
+    it via (in order):
+      1. Installed-package metadata (``pip install`` / ``pipx install``),
+         which is generated from ``pyproject.toml`` at build time.
+      2. For source checkouts where the package isn't installed, a regex
+         scan of ``pyproject.toml`` sitting next to this script.
+      3. ``"unknown"`` if neither is available (e.g., the .py was copied
+         out of its source tree without pyproject).
+    """
+    try:
+        from importlib.metadata import version as _v, PackageNotFoundError
+        try:
+            return _v("kempnerpulse")
+        except PackageNotFoundError:
+            pass
+    except ImportError:
+        pass
+    try:
+        pyproject = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "pyproject.toml")
+        with open(pyproject, "r", encoding="utf-8") as f:
+            for line in f:
+                m = re.match(r'^\s*version\s*=\s*"([^"]+)"', line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return "unknown"
+
+
+__version__ = _read_version()
 
 EXPORT_DEFAULT_COLUMNS = (
     "timestamp", "gpu_id", "model", "gpu_util_pct", "mem_used_mib",
