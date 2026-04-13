@@ -678,7 +678,12 @@ def parse_dcgm_dmon(text: str, gpu_models: Optional[Dict[str, str]] = None) -> S
 #   * The first tick is dropped: profiling fields return N/A on the very first
 #     sample of a cold dcgmi process.
 
-DCGM_STREAM_MIN_INTERVAL_MS = 100   # DCGM profiling refresh floor (see probe notes)
+# DCGM profiling counters (DCGM_FI_PROF_*) refresh at ~10Hz via the shared
+# hardware-counter multiplexer. Probing on H200 confirmed -d 100ms gives 0% N/A
+# rows; -d 50 alternates full/blank (44% N/A); -d 20 and below plateau at ~80%
+# N/A. Device fields (clocks/temps/power) do refresh faster, but the tool's
+# Real Util signal depends on profiling, so we clamp the streaming interval.
+DCGM_STREAM_MIN_INTERVAL_MS = 100
 
 
 def fmt_duration(seconds: float, *, signed: bool = False) -> str:
@@ -2661,7 +2666,7 @@ def main() -> int:
                         help="Metric collection backend. 'prometheus' reads from dcgm-exporter HTTP endpoint "
                              "(~30s resolution for profiling fields). 'dcgm' queries dcgmi dmon directly for "
                              "true high-resolution sampling (down to 100ms). Default: prometheus")
-    parser.add_argument("--poll", type=float, default=1.0, help="Sampling/refresh interval in seconds. With --backend dcgm, drives a persistent dcgmi stream and is honored down to a 100ms floor (DCGM's profiling refresh rate). With --backend prometheus, must be >= 1.0 (dcgm-exporter scrapes profiling fields at ~30s, so sub-second values just duplicate samples). Default: 1.0")
+    parser.add_argument("--poll", type=float, default=1.0, help="Sampling/refresh interval in seconds. With --backend dcgm, drives a persistent dcgmi stream and is honored down to a 100ms floor (DCGM profiling counters refresh at ~10Hz internally; smaller values would yield blank profiling rows). With --backend prometheus, must be >= 1.0 (dcgm-exporter scrapes profiling fields at ~30s, so sub-second values just duplicate samples). Default: 1.0")
     parser.add_argument("--history", type=int, default=120, help="Number of samples kept for sparkline history. Default: 120")
     parser.add_argument("--focus-gpu", default=None, help="Start in focused view for one GPU id, for example 0")
     parser.add_argument("--once", action="store_true", help="Render one snapshot and exit instead of running live")
@@ -2753,8 +2758,13 @@ def main() -> int:
     if use_dcgm_backend:
         poll_ms = max(DCGM_STREAM_MIN_INTERVAL_MS, int(round(args.poll * 1000)))
         if int(round(args.poll * 1000)) < DCGM_STREAM_MIN_INTERVAL_MS:
-            print(f"kempnerpulse: --poll {args.poll}s is below the dcgm profiling floor; "
-                  f"clamping to {DCGM_STREAM_MIN_INTERVAL_MS}ms.", file=sys.stderr)
+            print(
+                f"kempnerpulse: note — DCGM profiling counters "
+                f"(SM/Tensor/DRAM Active, etc.) refresh at ~10Hz internally; "
+                f"--poll {args.poll}s would yield mostly-blank profiling rows. "
+                f"Clamping to {DCGM_STREAM_MIN_INTERVAL_MS}ms.",
+                file=sys.stderr,
+            )
     else:
         poll_ms = int(round(args.poll * 1000))
         if args.poll < 1.0:

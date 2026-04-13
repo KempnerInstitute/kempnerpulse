@@ -34,11 +34,16 @@ kempnerpulse --backend dcgm --export all --poll 0.1 > metrics.csv
 
 | Backend | Effective range | Notes |
 |---------|----------------|-------|
-| `dcgm` (recommended for export) | `0.1s` – any | Drives a persistent `dcgmi dmon` stream at the requested interval. Values below 100ms are clamped (DCGM's profiling refresh floor). One CSV row-set is emitted per dcgmi tick — no spawned subprocess per cycle, no skew. |
+| `dcgm` (recommended for export) | `0.1s` – any | Drives a persistent `dcgmi dmon` stream at the requested interval. Values below 100ms are clamped with a notice — DCGM's profiling counters (`DCGM_FI_PROF_*`, i.e. SM/Tensor/DRAM Active and friends) refresh at ~10Hz via the shared hardware-counter multiplexer, so smaller intervals just produce blank profiling rows. One CSV row-set is emitted per dcgmi tick — no spawned subprocess per cycle, no skew. |
 | `prometheus` (default) | `>= 1.0s` | dcgm-exporter scrapes profiling fields at ~30s, so sub-second `--poll` values produce duplicate rows with no new data. Sub-second values are rejected with a warning. |
 
 For high-resolution profiling traces (e.g., capturing tensor activity at
-100ms resolution to plot offline), use `--backend dcgm --poll 0.1`.
+100ms resolution to plot offline), use `--backend dcgm --poll 0.1`. Note
+that only the profiling columns are bounded by the 10Hz internal
+refresh; device columns (clocks, temps, power, framebuffer) are sampled
+every tick and would update faster if the floor were lowered — but we
+keep the floor at 100ms because Real Util and the workload
+classification depend on the profiling counters.
 
 ## Default Columns
 
