@@ -21,7 +21,22 @@ kempnerpulse --export --once
 
 # Combine with other flags
 kempnerpulse --export all --poll 5 --gpus 0,1 > metrics.csv
+
+# High-resolution sampling via the dcgm backend (down to 100ms)
+kempnerpulse --backend dcgm --export all --poll 0.1 > metrics.csv
 ```
+
+## Sampling Rate (`--poll`)
+
+`--poll` semantics depend on the backend:
+
+| Backend | Effective range | Notes |
+|---------|----------------|-------|
+| `dcgm` (recommended for export) | `0.1s` – any | Drives a persistent `dcgmi dmon` stream at the requested interval. Values below 100ms are clamped (DCGM's profiling refresh floor). One CSV row-set is emitted per dcgmi tick — no spawned subprocess per cycle, no skew. |
+| `prometheus` (default) | `>= 1.0s` | dcgm-exporter scrapes profiling fields at ~30s, so sub-second `--poll` values produce duplicate rows with no new data. Sub-second values are rejected with a warning. |
+
+For high-resolution profiling traces (e.g., capturing tensor activity at
+100ms resolution to plot offline), use `--backend dcgm --poll 0.1`.
 
 ## Default Columns
 

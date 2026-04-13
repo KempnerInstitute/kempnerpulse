@@ -141,7 +141,7 @@ kempnerpulse --export --once
 | `--version` | | | Show version and exit. |
 | `--backend` | string | `prometheus` | Data source backend: `prometheus` (dcgm-exporter HTTP) or `dcgm` (dcgmi dmon direct). |
 | `--source URL` | string | `http://localhost:9400/metrics` | dcgm-exporter `/metrics` endpoint or a local text file (prometheus backend only). |
-| `--poll SECS` | float | `1.0` | Dashboard redraw interval in seconds (does not change DCGM sampling rate). |
+| `--poll SECS` | float | `1.0` | Sampling/refresh interval in seconds. With `--backend dcgm`, drives a persistent `dcgmi` stream and is honored down to a 100ms floor (DCGM's profiling refresh rate). With `--backend prometheus`, must be `>= 1.0` (dcgm-exporter scrapes profiling fields at ~30s, so sub-second values just duplicate samples). |
 | `--history N` | int | `120` | Number of samples kept for sparkline history. |
 | `--focus-gpu ID` | string | | Start in Focus View for the given GPU id (e.g. `0`). |
 | `--once` | flag | | Render a single snapshot and exit instead of running live. |

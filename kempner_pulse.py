@@ -2705,7 +2705,7 @@ def main() -> int:
                         help="Metric collection backend. 'prometheus' reads from dcgm-exporter HTTP endpoint "
                              "(~30s resolution for profiling fields). 'dcgm' queries dcgmi dmon directly for "
                              "true high-resolution sampling (down to 100ms). Default: prometheus")
-    parser.add_argument("--poll", type=float, default=1.0, help="UI refresh interval in seconds. This redraws the dashboard; it does not force DCGM itself to sample faster. Default: 1.0")
+    parser.add_argument("--poll", type=float, default=1.0, help="Sampling/refresh interval in seconds. With --backend dcgm, drives a persistent dcgmi stream and is honored down to a 100ms floor (DCGM's profiling refresh rate). With --backend prometheus, must be >= 1.0 (dcgm-exporter scrapes profiling fields at ~30s, so sub-second values just duplicate samples). Default: 1.0")
     parser.add_argument("--history", type=int, default=120, help="Number of samples kept for sparkline history. Default: 120")
     parser.add_argument("--focus-gpu", default=None, help="Start in focused view for one GPU id, for example 0")
     parser.add_argument("--once", action="store_true", help="Render one snapshot and exit instead of running live")
