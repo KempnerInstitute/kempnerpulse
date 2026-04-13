@@ -11,13 +11,16 @@ if sys.version_info < (3, 9):
     sys.exit("KempnerPulse requires Python 3.9 or later.")
 
 import argparse
+import atexit
 import csv
 import grp
 import math
 import os
 import pwd
 import re
+import signal
 import socket
+import threading
 import time
 import subprocess
 import urllib.request
@@ -655,6 +658,270 @@ def parse_dcgm_dmon(text: str, gpu_models: Optional[Dict[str, str]] = None) -> S
             labels[gpu_id]["modelName"] = gpu_models[gpu_id]
 
     return Sample(ts=time.time(), metrics=dict(metrics), labels=dict(labels))
+
+
+# ── Streaming DCGM reader ────────────────────────────────────────────────────
+#
+# One persistent ``dcgmi dmon -c 0 -d <poll_ms>`` subprocess feeds both the TUI
+# and the CSV export writer. A reader thread parses each tick block into a
+# ``Sample`` and publishes the latest pair (current + previous) under a
+# condition variable so consumers can either poll (TUI) or block until a new
+# sample arrives (export).
+#
+# Tick boundary detection (empirically verified on H200):
+#   * dcgmi emits no blank lines between ticks.
+#   * The ``#Entity`` header is printed once at start and again every ~15 data
+#     rows. Header and ``ID`` lines are ignored.
+#   * A tick ends when we see a ``GPU <id>`` whose ``<id>`` is already present
+#     in the current buffer — so we flush the buffer and start a new one with
+#     the repeating line.
+#   * The first tick is dropped: profiling fields return N/A on the very first
+#     sample of a cold dcgmi process.
+
+DCGM_STREAM_MIN_INTERVAL_MS = 100   # DCGM profiling refresh floor (see probe notes)
+
+
+class DcgmStreamError(RuntimeError):
+    """Raised when the dcgmi streaming subprocess fails or exits unexpectedly."""
+
+
+class DcgmStreamReader:
+    """Background reader around a persistent ``dcgmi dmon -c 0`` subprocess."""
+
+    def __init__(self,
+                 gpu_ids: Optional[List[str]],
+                 poll_ms: int,
+                 gpu_models: Optional[Dict[str, str]] = None):
+        self._gpu_ids = gpu_ids
+        self._poll_ms = max(DCGM_STREAM_MIN_INTERVAL_MS, int(poll_ms))
+        self._gpu_models = gpu_models or {}
+        self._proc: Optional[subprocess.Popen] = None
+        self._reader_thread: Optional[threading.Thread] = None
+        self._stderr_thread: Optional[threading.Thread] = None
+        self._cond = threading.Condition()
+        self._stop = threading.Event()
+        self._latest: Optional[Sample] = None
+        self._prev: Optional[Sample] = None
+        self._counter: int = 0
+        self._skipped_first: bool = False
+        self._error: Optional[BaseException] = None
+        self._started = False
+
+    # ── lifecycle ───────────────────────────────────────────────────────
+
+    def start(self) -> None:
+        if self._started:
+            return
+        cmd = ["dcgmi", "dmon", "-c", "0", "-d", str(self._poll_ms),
+               "-e", DCGM_DMON_FIELD_IDS]
+        if self._gpu_ids:
+            cmd.extend(["-i", ",".join(f"gpu:{gid}" for gid in self._gpu_ids)])
+        # Stripping CUDA_VISIBLE_DEVICES suppresses dcgmi's multi-line stdout
+        # warning preamble; dcgmi targets the hostengine, not CUDA, so the
+        # variable has no functional effect on which GPUs it reports.
+        env = {k: v for k, v in os.environ.items() if k != "CUDA_VISIBLE_DEVICES"}
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+                env=env,
+            )
+        except FileNotFoundError as exc:
+            raise DcgmStreamError(f"dcgmi not found: {exc}") from exc
+
+        self._reader_thread = threading.Thread(
+            target=self._read_stdout, name="dcgm-stream", daemon=True,
+        )
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, name="dcgm-stream-err", daemon=True,
+        )
+        self._reader_thread.start()
+        self._stderr_thread.start()
+        self._started = True
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        self._stop.set()
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+        # Wake any blocked consumers
+        with self._cond:
+            self._cond.notify_all()
+        for t in (self._reader_thread, self._stderr_thread):
+            if t is not None and t.is_alive():
+                t.join(timeout=1.0)
+        self._started = False
+
+    # ── consumer APIs ───────────────────────────────────────────────────
+
+    def get_pair(self) -> Tuple[Optional[Sample], Optional[Sample]]:
+        """Non-blocking snapshot of (latest, prev). Used by the TUI."""
+        with self._cond:
+            if self._error is not None and self._latest is None:
+                raise DcgmStreamError(str(self._error))
+            return self._latest, self._prev
+
+    def wait_for_new(self,
+                     last_counter: int,
+                     timeout: float = 2.0,
+                     ) -> Tuple[Optional[Sample], Optional[Sample], int]:
+        """Block until the sample counter advances past ``last_counter``.
+
+        Returns (latest, prev, new_counter). If the reader has stopped or
+        errored before a new sample arrives, returns (None, None, last_counter).
+        """
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._counter <= last_counter and not self._stop.is_set() and self._error is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cond.wait(timeout=remaining)
+            if self._error is not None and self._latest is None:
+                raise DcgmStreamError(str(self._error))
+            if self._stop.is_set() and self._counter <= last_counter:
+                return None, None, last_counter
+            return self._latest, self._prev, self._counter
+
+    def wait_first_sample(self, timeout: float = 5.0) -> bool:
+        """Block until the first valid sample is published. Returns True on success."""
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._counter == 0 and not self._stop.is_set() and self._error is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(timeout=remaining)
+            if self._error is not None:
+                raise DcgmStreamError(str(self._error))
+            return self._counter > 0
+
+    # ── internal: stdout reader ─────────────────────────────────────────
+
+    def _read_stdout(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        current: Dict[str, List[str]] = {}  # gpu_id -> full line (most recent wins)
+        order: List[str] = []                # gpu_id order in current tick
+
+        try:
+            for raw_line in proc.stdout:
+                if self._stop.is_set():
+                    break
+                line = raw_line.rstrip("\n")
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                # Skip header lines and any dcgmi preamble that isn't a GPU data row
+                if stripped.startswith("#") or stripped.startswith("ID"):
+                    continue
+                parts = stripped.split()
+                if len(parts) < 2 or parts[0] != "GPU":
+                    continue
+                gpu_id = parts[1]
+                if gpu_id in current:
+                    # Boundary: this id already has a row → flush and start new tick
+                    self._publish(current, order)
+                    current = {}
+                    order = []
+                current[gpu_id] = line
+                order.append(gpu_id)
+            # stdout closed → subprocess exited
+            rc = proc.poll()
+            if rc is not None and rc != 0 and not self._stop.is_set():
+                stderr_tail = ""
+                if proc.stderr is not None:
+                    try:
+                        stderr_tail = proc.stderr.read() or ""
+                    except Exception:
+                        pass
+                self._set_error(DcgmStreamError(
+                    f"dcgmi dmon exited with code {rc}: {stderr_tail.strip()}"
+                ))
+        except Exception as exc:
+            self._set_error(exc)
+        finally:
+            # Wake any blocked consumers on shutdown/error
+            with self._cond:
+                self._cond.notify_all()
+
+    def _publish(self, current: Dict[str, List[str]], order: List[str]) -> None:
+        if not current:
+            return
+        # Reassemble block text in original order, then parse once
+        block_text = "\n".join(current[gid] for gid in order)
+        sample = parse_dcgm_dmon(block_text, self._gpu_models)
+        if not self._skipped_first:
+            # Drop the first tick — profiling fields often N/A on cold dcgmi start
+            self._skipped_first = True
+            return
+        with self._cond:
+            self._prev = self._latest
+            self._latest = sample
+            self._counter += 1
+            self._cond.notify_all()
+
+    # ── internal: stderr drain ──────────────────────────────────────────
+
+    def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            for line in proc.stderr:
+                if self._stop.is_set():
+                    break
+                if line.strip():
+                    sys.stderr.write(f"[dcgmi] {line}")
+                    sys.stderr.flush()
+        except Exception:
+            pass
+
+    # ── internal: error ─────────────────────────────────────────────────
+
+    def _set_error(self, exc: BaseException) -> None:
+        with self._cond:
+            if self._error is None:
+                self._error = exc
+            self._cond.notify_all()
+
+
+class OwnershipCache:
+    """Caches the result of ``query_gpu_processes`` with a short TTL.
+
+    Used by the export loop so that nvidia-smi is not spawned every tick when
+    ``--poll`` is small. Process ownership rarely changes at sub-second scales.
+    """
+
+    def __init__(self, bus_id_map: Dict[str, str], ttl: float = 2.0):
+        self._bus_id_map = bus_id_map
+        self._ttl = ttl
+        self._last_refresh: float = 0.0
+        self._cached: Dict[str, List["GpuProcess"]] = {}
+
+    def get(self, now: Optional[float] = None) -> Dict[str, List["GpuProcess"]]:
+        t = now if now is not None else time.time()
+        if t - self._last_refresh >= self._ttl or not self._cached:
+            self._cached = query_gpu_processes(self._bus_id_map)
+            self._last_refresh = t
+        return self._cached
 
 
 # ── nvidia-smi hardware queries ──────────────────────────────────────────────
