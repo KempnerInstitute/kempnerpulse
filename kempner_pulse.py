@@ -781,6 +781,11 @@ class DcgmStreamReader:
         self._skipped_first: bool = False
         self._error: Optional[BaseException] = None
         self._started = False
+        # dcgmi dmon reports field 449 (NVLINK_BANDWIDTH_TOTAL) as per-interval
+        # values, not as a cumulative counter (unlike fields 156 and 202 which
+        # ARE cumulative). Accumulate into a running total so downstream rate()
+        # sees a monotonically growing counter and computes bytes/s correctly.
+        self._nvlink_accum: Dict[str, float] = {}
 
     # ── lifecycle ───────────────────────────────────────────────────────
 
@@ -948,6 +953,13 @@ class DcgmStreamReader:
         # Reassemble block text in original order, then parse once
         block_text = "\n".join(current[gid] for gid in order)
         sample = parse_dcgm_dmon(block_text, self._gpu_models)
+        # Accumulate NVLINK_BANDWIDTH_TOTAL per-interval values into a running
+        # total so rate() sees a monotonic counter (see __init__ comment).
+        for gpu_id, metrics in sample.metrics.items():
+            raw = metrics.get(NVLINK_TOTAL_METRIC)
+            if raw is not None:
+                self._nvlink_accum[gpu_id] = self._nvlink_accum.get(gpu_id, 0.0) + raw
+                metrics[NVLINK_TOTAL_METRIC] = self._nvlink_accum[gpu_id]
         if not self._skipped_first:
             # Drop the first tick — profiling fields often N/A on cold dcgmi start
             self._skipped_first = True
