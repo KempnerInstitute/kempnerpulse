@@ -102,8 +102,7 @@ pick a custom set.
   compute process are included. If no processes are found, only the header is
   output and a diagnostic message is printed to stderr.
 - **Rate fields**: `pcie_replay_rate_s` requires two samples to compute a
-  rate, so it will be empty on the first row. `nvlink_gbps` is an
-  instantaneous reading and is available immediately.
+  rate, so it will be empty on the first row.
 - **Missing values**: Exported as empty strings in the CSV.
 - **Pipe-friendly**: Output is flushed after each poll interval. Handles
   `BrokenPipeError` gracefully (e.g. `kempnerpulse --export | head -20`).
