@@ -63,7 +63,6 @@ RATIO_0_1 = {
 COUNTER_METRICS = {
     "DCGM_FI_DEV_TOTAL_ENERGY_CONSUMPTION",
     "DCGM_FI_DEV_PCIE_REPLAY_COUNTER",
-    "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL",
 }
 
 NVLINK_TOTAL_METRIC = "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL"
@@ -85,7 +84,7 @@ DCGM_DMON_FIELDS: Tuple[Tuple[int, str], ...] = (
     (251,  "DCGM_FI_DEV_FB_FREE"),                 # MiB
     (252,  "DCGM_FI_DEV_FB_USED"),                 # MiB
     (253,  "DCGM_FI_DEV_FB_RESERVED"),             # MiB
-    (449,  "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL"),  # bytes (counter)
+    (449,  "DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL"),  # MB/s (gauge, despite dcgm-exporter labelling it counter)
     # Profiling metrics (ratio 0-1)
     (1001, "DCGM_FI_PROF_GR_ENGINE_ACTIVE"),
     (1002, "DCGM_FI_PROF_SM_ACTIVE"),
@@ -1333,6 +1332,17 @@ def bytes_per_s_to_gbps(v: Optional[float]) -> Optional[float]:
     return float(v) / 1e9
 
 
+def nvlink_to_gbps(v: Optional[float]) -> Optional[float]:
+    """Convert DCGM field 449 value (MB/s) to GB/s.
+
+    Both dcgmi dmon and dcgm-exporter report DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL
+    as an instantaneous rate in MB/s (not a cumulative counter).
+    """
+    if v is None:
+        return None
+    return float(v) / 1e3
+
+
 def fmt_gbps(v: Optional[float], digits: int = 2) -> str:
     if v is None or math.isnan(v):
         return "--"
@@ -1645,7 +1655,7 @@ def update_history(history: HistoryStore, states: List[DerivedGPUState]) -> None
             history.push(s.gpu_id, "pcie_tx", pcie_tx)
         if pcie_rx is not None and pcie_tx is not None:
             history.push(s.gpu_id, "pcie_rxtx", pcie_rx + pcie_tx)
-        nvlink_gbps = bytes_per_s_to_gbps(s.rates.get(NVLINK_TOTAL_METRIC))
+        nvlink_gbps = nvlink_to_gbps(s.values.get(NVLINK_TOTAL_METRIC))
         if nvlink_gbps is not None:
             history.push(s.gpu_id, "nvlink_gbps", nvlink_gbps)
         fp64 = to_percent("DCGM_FI_PROF_PIPE_FP64_ACTIVE", s.values.get("DCGM_FI_PROF_PIPE_FP64_ACTIVE"))
@@ -1724,7 +1734,7 @@ def export_gpu_row(state: DerivedGPUState, timestamp: float,
         elif key == "_mem_used_pct":
             row.append(f"{state.memory_used_pct:.2f}" if state.memory_used_pct is not None else "")
         elif key == "_nvlink_gbps":
-            gbps = bytes_per_s_to_gbps(state.rates.get(NVLINK_TOTAL_METRIC))
+            gbps = nvlink_to_gbps(state.values.get(NVLINK_TOTAL_METRIC))
             row.append(f"{gbps:.4f}" if gbps is not None else "")
         elif key == "_pcie_replay_rate":
             rr = state.rates.get("DCGM_FI_DEV_PCIE_REPLAY_COUNTER")
@@ -1941,7 +1951,7 @@ def gpu_card(state: DerivedGPUState, history: HistoryStore, power_limit: Optiona
     right.add_column(justify="left", min_width=11, no_wrap=True)
     right.add_column(justify="right", min_width=22, no_wrap=True)
     memcpy_pct = to_percent("DCGM_FI_DEV_MEM_COPY_UTIL", state.values.get("DCGM_FI_DEV_MEM_COPY_UTIL"))
-    nvlink_gbps = bytes_per_s_to_gbps(state.rates.get(NVLINK_TOTAL_METRIC))
+    nvlink_gbps = nvlink_to_gbps(state.values.get(NVLINK_TOTAL_METRIC))
     right.add_row("Memcpy", Text(fmt_pct(memcpy_pct), style=usage_style(memcpy_pct)))
     right.add_row("PCIe RX", Text(fmt_bytes_per_s(state.values.get("DCGM_FI_PROF_PCIE_RX_BYTES")), style="cyan"))
     right.add_row("PCIe TX", Text(fmt_bytes_per_s(state.values.get("DCGM_FI_PROF_PCIE_TX_BYTES")), style="cyan"))
@@ -2251,7 +2261,7 @@ def selected_gpu_panel(state: DerivedGPUState, history: HistoryStore, power_limi
     gpu = state.gpu_id
     title = f"Focused GPU {gpu}   {state.identity.get('device', '')}   {state.identity.get('pci_bus_id', '')}"
 
-    nvlink_gbps = bytes_per_s_to_gbps(state.rates.get(NVLINK_TOTAL_METRIC))
+    nvlink_gbps = nvlink_to_gbps(state.values.get(NVLINK_TOTAL_METRIC))
     nvlink_max = nvlink_limit or 400.0
 
     # Helper to read a profiling-level percent metric; returns None when absent.
@@ -2606,8 +2616,8 @@ Metrics and interpretation:
   DRAM           Fraction of cycles device memory is actively moving data.
   Memcpy         Device memory-copy engine utilization.
   PCIe RX/TX     Host-device throughput from dcgm-exporter in bytes/sec.
-  NVLink Δ       Per-second change from DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL,
-                 shown as decimal GB/s.
+  NVLink Δ       Instantaneous NVLink bandwidth from DCGM field 449 (MB/s),
+                 converted to GB/s.
 
 Status classification (thresholds from NVIDIA DCGM profiling metric guidance):
 
