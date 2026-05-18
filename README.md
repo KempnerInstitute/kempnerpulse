@@ -87,7 +87,7 @@ pip install .
 
 If you prefer not to perform a full installation, you can run the wrapper script directly from the login node by targeting your active GPU node.
 
-> **Note:** `kempnerpulse-on-cnode.sh` currently works only on the **FASRC cluster**. It expects the shared kempnerpulse virtual environment to be available at `/n/holylfs06/LABS/kempner_shared/Everyone/common_envs/kempnerpulse/.venv` on the target compute node, and will exit gracefully if the environment is not found.
+> **Note:** `kempnerpulse-on-cnode.sh` currently works only on the **FASRC cluster** for the shared kempnerpulse virtual environment to be available on the target compute node, and will exit gracefully if the environment is not found.
 
 Identify your compute node:
 ```bash
