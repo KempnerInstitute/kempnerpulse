@@ -45,7 +45,7 @@ main() {
   if [[ -n "${KEMPNERPULSE_VENVPATH:-}" ]]; then
     venv_activate="${KEMPNERPULSE_VENVPATH%/}/bin/activate"
     override_used=1
-    ssh -o StrictHostKeyChecking=no "$node" "test -f $(printf '%q' "$venv_activate")" || pre_check_exit=$?
+    ssh -o StrictHostKeyChecking=accept-new "$node" "test -f $(printf '%q' "$venv_activate")" || pre_check_exit=$?
     case "$pre_check_exit" in
       0)
         override_verified=1
@@ -81,7 +81,7 @@ main() {
     remote_cmd+=" $(printf '%q' "$arg")"
   done
 
-  ssh -tt -o StrictHostKeyChecking=no "$node" bash -lc "$(printf '%q' "$remote_cmd")" || ssh_exit=$?
+  ssh -tt -o StrictHostKeyChecking=accept-new "$node" bash -lc "$(printf '%q' "$remote_cmd")" || ssh_exit=$?
 
   if (( override_used )) && (( override_verified )); then
     echo
