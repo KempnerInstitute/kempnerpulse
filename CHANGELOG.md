@@ -7,7 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-27
+
+This release replaces the single-file implementation with a layered package.
+The command-line interface is unchanged apart from the new default backend and
+poll interval noted below; the **Python import surface is not** — see *Removed*.
+
+### Added
+- **Layered architecture** (`src/kempnerpulse/`): a four-stage data-flow pipeline
+  — `reader/` (raw acquisition) → `translate/` (vendor-neutral canonical record)
+  → `compute/` (pure-functional real-util, classification, health) →
+  `present/` (Rich TUI and CSV). Backend and DCGM field vocabulary now stop at
+  Layer 2, and the domain logic in Layer 3 is testable with no GPU present. A
+  cross-cutting tier holds `config`, `identification`, `selection`,
+  `system_queries`, and `lifecycle`. See `docs/architecture.md`.
+- **`replay` backend** (`--backend replay`) — drives the whole pipeline from a
+  saved capture, so the UI and compute layers can be exercised without DCGM or
+  a GPU.
+- **`kp`** as a short console-script alias for `kempnerpulse`.
+- **Test suite** — 156 tests under `tests/` (unit per layer, plus an
+  integration test over the full pipeline) with recorded dcgmi and Prometheus
+  fixtures.
+- **Continuous integration** — `.github/workflows/tests.yml` runs the suite;
+  `.github/workflows/docs.yml` builds the documentation.
+- **Documentation site** — Sphinx + MyST sources under `docs/`, covering
+  install, quickstart, views, backends, CLI, running on SLURM, the canonical
+  schema, and the classification taxonomy. Most of the former README body moved
+  here.
+- **`uv.lock`** — a pinned, reproducible development environment; `uv run pytest`
+  and `uv run kp` work with no manual setup.
+
 ### Changed
+- **Package layout is now src-based.** The console entry point moved from
+  `kempner_pulse:main` to `kempnerpulse.__main__:main`, and the version is
+  single-sourced from `pyproject.toml` via `importlib.metadata`.
 - **Default backend is now `dcgm`** (previously `prometheus`), and **`--poll` is
   backend-aware**: `0.1` s (100 ms) for `--backend dcgm`, `1.0` s for
   `--backend prometheus`. A bare `kempnerpulse` is now equivalent to
@@ -59,12 +92,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mini-fleet is dropped (the focused panel goes full width) when the window is too
   narrow to show both.
 
-### Added
-- `tests/test_status_labels.py` — guards that (a) no workload-status label exceeds
-  the current maximum length and (b) every status `derive_real_util` can return is
-  registered in `WORKLOAD_STATUS_LABELS`, so the derived status-column width stays
-  valid as the taxonomy evolves.
-- **Minimum-size gate**: when the terminal is too small to render a GPU card without
-  squeezing, the dashboard shows a "Terminal too small" placeholder reporting current
-  vs required **width and height** (flagging which dimension is short) instead of
-  distorting the values.
+### Removed
+- **The flat `kempner_pulse.py` module** (3038 lines) is gone, superseded by the
+  `kempnerpulse` package. This is a **breaking change for importers**: code doing
+  `import kempner_pulse` must move to `import kempnerpulse` and the corresponding
+  layer submodule. The `kempnerpulse` command itself is unaffected.
+- Interim compatibility shims and the pre-rewrite test files used during the
+  transition.
