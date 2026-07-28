@@ -62,13 +62,13 @@ class Translator:
         # DCGM field 449 is the preferred aggregate NVLink gauge. On some
         # systems it reports N/A while profiling fields 1011/1012 still expose
         # usable TX/RX rates, so synthesize the same canonical aggregate.
+        # Both directions are required: summing a one-sided reading would
+        # silently under-report the total rather than admit it is unknown.
         if canonical.get(NVLINK_AGGREGATE_FIELD) is None:
-            tx = raw.fields.get(NVLINK_TX_FIELD)
-            rx = raw.fields.get(NVLINK_RX_FIELD)
-            if tx is not None or rx is not None:
-                canonical[NVLINK_AGGREGATE_FIELD] = (
-                    float(tx or 0.0) + float(rx or 0.0)
-                )
+            tx = convert("number", raw.fields.get(NVLINK_TX_FIELD))
+            rx = convert("number", raw.fields.get(NVLINK_RX_FIELD))
+            if tx is not None and rx is not None:
+                canonical[NVLINK_AGGREGATE_FIELD] = max(0.0, tx + rx)
 
         # Derived: total framebuffer = used + free + reserved (when all present).
         used = canonical.get("gpu_framebuffer_used_mebibytes")
