@@ -25,9 +25,18 @@ def test_na_becomes_none_never_zero():
     cold_gpu0 = records[0]  # first tick: profiling fields are N/A
     assert cold_gpu0.fields["DCGM_FI_PROF_SM_ACTIVE"] is None
     assert cold_gpu0.fields["DCGM_FI_PROF_PIPE_TENSOR_ACTIVE"] is None
+    assert cold_gpu0.fields["DCGM_FI_PROF_NVLINK_TX_BYTES"] is None
+    assert cold_gpu0.fields["DCGM_FI_PROF_NVLINK_RX_BYTES"] is None
     # device fields in the same row are real values
     assert cold_gpu0.fields["DCGM_FI_DEV_POWER_USAGE"] == 350.5
     assert cold_gpu0.fields["DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL"] == 25000.0
+
+
+def test_nvlink_profile_fields_are_parsed():
+    records = parse_dmon_block(_load())
+    warm_gpu1 = records[3]
+    assert warm_gpu1.fields["DCGM_FI_PROF_NVLINK_TX_BYTES"] == 210000000000.0
+    assert warm_gpu1.fields["DCGM_FI_PROF_NVLINK_RX_BYTES"] == 220000000000.0
 
 
 def test_skips_headers_and_blank_lines():

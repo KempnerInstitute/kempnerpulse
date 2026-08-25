@@ -32,6 +32,10 @@ HTTP endpoint (or reads a saved exposition-format file).
 - **Aggregation:** each sample is a **window** average over the exporter's
   collection interval.
 - **Requires:** a reachable exporter endpoint (`--source`).
+- **NVLink fallback:** the shipped `dcgm-exporter` counters CSVs omit
+  `DCGM_FI_PROF_NVLINK_TX_BYTES` and `DCGM_FI_PROF_NVLINK_RX_BYTES`. Add both
+  fields to the exporter's counters CSV to enable the TX+RX fallback when field
+  449 is unavailable; otherwise field 449 remains the only NVLink source.
 - **Best for:** fleet-level monitoring where an exporter is already deployed.
 
 ```bash

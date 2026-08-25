@@ -59,6 +59,8 @@ DCGM_DMON_FIELDS: Tuple[Tuple[int, str], ...] = (
     (1008, "DCGM_FI_PROF_PIPE_FP16_ACTIVE"),
     (1009, "DCGM_FI_PROF_PCIE_TX_BYTES"),           # bytes/sec
     (1010, "DCGM_FI_PROF_PCIE_RX_BYTES"),           # bytes/sec
+    (1011, "DCGM_FI_PROF_NVLINK_TX_BYTES"),         # bytes/sec
+    (1012, "DCGM_FI_PROF_NVLINK_RX_BYTES"),         # bytes/sec
 )
 
 DCGM_DMON_FIELD_IDS = ",".join(str(fid) for fid, _ in DCGM_DMON_FIELDS)
@@ -198,7 +200,7 @@ def run_dmon_once(
 ) -> str:
     """Run one ``dcgmi dmon -c 2`` collection and return its raw stdout text.
 
-    Two samples are requested because profiling fields (1001-1010) return
+    Two samples are requested because profiling fields (1001-1012) return
     ``N/A`` on the first sample of a cold invocation; the valid second tick lets
     a downstream last-non-``None``-wins merge recover the real values.
     """

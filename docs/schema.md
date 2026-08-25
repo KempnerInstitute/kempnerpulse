@@ -97,7 +97,7 @@ local / non-Slurm runs still produce valid records.
 | `gpu_pcie_transmit_throughput_bytes_per_second` | bytes/s (differenced) |
 | `gpu_pcie_receive_throughput_bytes_per_second` | bytes/s (differenced) |
 | `gpu_pcie_replay_count` | count (cumulative) |
-| `gpu_nvlink_aggregate_throughput_bytes_per_second` | bytes/s (differenced) |
+| `gpu_nvlink_aggregate_throughput_bytes_per_second` | bytes/s (gauge; not differenced) |
 | `gpu_board_power_draw_watts` | watts |
 | `gpu_board_total_energy_joules` | joules (cumulative) |
 | `gpu_board_enforced_power_limit_watts` | watts |

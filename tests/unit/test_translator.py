@@ -36,6 +36,55 @@ def test_units_normalized_to_canonical():
     assert g1t2.gpu_pcie_transmit_throughput_bytes_per_second == 1600000000.0
 
 
+def test_nvlink_profile_fields_fallback_when_aggregate_missing():
+    assert _nvlink_raw(
+        DCGM_FI_PROF_NVLINK_TX_BYTES=110e9,
+        DCGM_FI_PROF_NVLINK_RX_BYTES=120e9,
+    ) == 230e9
+
+
+def test_nvlink_aggregate_field_takes_precedence_over_profile_fields():
+    _, recs = _translate_all()
+    g1t2 = recs[3]  # aggregate field is present, so TX/RX are ignored
+    assert g1t2.gpu_nvlink_aggregate_throughput_bytes_per_second == 25600 * 1e6
+
+
+def _nvlink_raw(**fields):
+    tr = make_translator(BackendKind.DCGMI, hostname="testnode")
+    raw = RawRecord(
+        timestamp=0.0, wallclock=0.0, entity_id=0,
+        fields=fields, source="dcgm", source_version="test",
+    )
+    return tr.translate(raw).gpu_nvlink_aggregate_throughput_bytes_per_second
+
+
+def test_nvlink_zero_aggregate_is_idle_not_missing():
+    """A real 0.0 from field 449 means idle, so the fallback must not fire."""
+    assert _nvlink_raw(
+        DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL=0.0,
+        DCGM_FI_PROF_NVLINK_TX_BYTES=110e9,
+        DCGM_FI_PROF_NVLINK_RX_BYTES=120e9,
+    ) == 0.0
+
+
+def test_nvlink_one_sided_profile_reading_is_not_reported():
+    """Half a sum would under-report the total, so report nothing instead."""
+    assert _nvlink_raw(DCGM_FI_PROF_NVLINK_TX_BYTES=110e9) is None
+    assert _nvlink_raw(DCGM_FI_PROF_NVLINK_RX_BYTES=120e9) is None
+
+
+def test_nvlink_negative_profile_reading_is_clamped():
+    """Matches the clamp the mapped 449 path gets, so validation cannot fail."""
+    assert _nvlink_raw(
+        DCGM_FI_PROF_NVLINK_TX_BYTES=-5e9,
+        DCGM_FI_PROF_NVLINK_RX_BYTES=1e9,
+    ) == 0.0
+
+
+def test_nvlink_absent_everywhere_stays_none():
+    assert _nvlink_raw(DCGM_FI_DEV_POWER_USAGE=100.0) is None
+
+
 def test_framebuffer_total_derived():
     _, recs = _translate_all()
     g1t2 = recs[3]
