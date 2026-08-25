@@ -12,10 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL` (field 449) reports `N/A` on some systems
   while the NVLink profiling fields `DCGM_FI_PROF_NVLINK_TX_BYTES` and
   `DCGM_FI_PROF_NVLINK_RX_BYTES` (1011/1012) still carry usable per-direction
-  rates. Those two fields are now collected, and the canonical NVLink aggregate
-  falls back to their sum when 449 is missing. A real `0.0` from 449 means idle
-  and does *not* trigger the fallback, and a one-sided reading is reported as
-  unknown rather than as a silently halved total (#21)
+  rates. The direct `dcgm` backend now collects those two fields, and the
+  canonical NVLink aggregate falls back to their sum when 449 is missing. A
+  real `0.0` from 449 means idle and does *not* trigger the fallback, and a
+  one-sided reading is reported as unknown rather than as a silently halved
+  total (#21)
 
 ## [0.5.0] - 2026-07-27
 

@@ -63,14 +63,15 @@ def test_pipeline_yields_computed_records():
 
 def test_pipeline_csv_export_matches_header_width():
     last = _computed_ticks()[-1]
+    assert last[0].record.gpu_nvlink_aggregate_throughput_bytes_per_second is None
     cols = resolve_columns("all")
     header = csv_header(cols)
     assert "real_util_pct" in header and "sm_active_pct" in header and "nvlink_gbps" in header
     ts = last[0].record.record_timestamp_wallclock_unix_seconds
     row = csv_row(last[0], ts, cols)
     assert len(row) == len(header)
-    # N/A stays empty, never coerced to 0 (gpu0 NVLink was N/A in tick 2)
-    assert all(cell == "" or cell is not None for cell in row)
+    # N/A stays empty, never coerced to 0 (GPU 0 NVLink is unavailable in tick 2).
+    assert row[header.index("nvlink_gbps")] == ""
 
 
 def test_pipeline_dashboard_renders():

@@ -72,11 +72,20 @@ Memory used % = `100 × FB_USED / total`.
 | PCIe RX | `DCGM_FI_PROF_PCIE_RX_BYTES` | PCIe receive throughput. ≥ 1 GB/s triggers I/O classification. | Classification, Fleet / Focus / Plot views |
 | PCIe TX | `DCGM_FI_PROF_PCIE_TX_BYTES` | PCIe transmit throughput. ≥ 1 GB/s triggers I/O classification. | Classification, Fleet / Focus / Plot views |
 
-## NVLink (bytes, monotonic counter converted to rate)
+## NVLink (throughput gauges)
 
 | Metric | DCGM Field | Description | Used In |
 |--------|-----------|-------------|---------|
-| NVLink BW Total | `DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL` | Cumulative NVLink bytes. Dashboard computes Δ/s and displays GB/s. | Fleet / Focus views |
+| NVLink BW Total | `DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL` (`449`) | Aggregate throughput gauge in MB/s. Converted directly to bytes/s, without differencing. | Fleet / Focus views |
+| NVLink TX | `DCGM_FI_PROF_NVLINK_TX_BYTES` (`1011`) | Transmit throughput in bytes/s. | Aggregate fallback |
+| NVLink RX | `DCGM_FI_PROF_NVLINK_RX_BYTES` (`1012`) | Receive throughput in bytes/s. | Aggregate fallback |
+
+Field 449 is preferred whenever it has a value, including `0.0` for an idle
+link. When it is unavailable, KempnerPulse sums fields 1011 and 1012 only if
+both directions are present; if either is missing, the canonical aggregate
+remains unknown. The direct `dcgm` backend requests all three fields. The
+Prometheus backend depends on which fields `dcgm-exporter` is configured to
+publish; see [Backends](guide/backends.md).
 
 ## Energy (monotonic counter)
 

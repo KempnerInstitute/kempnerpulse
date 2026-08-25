@@ -37,9 +37,10 @@ def test_units_normalized_to_canonical():
 
 
 def test_nvlink_profile_fields_fallback_when_aggregate_missing():
-    _, recs = _translate_all()
-    g0t2 = recs[2]  # aggregate field is N/A, profiling TX/RX are valid
-    assert g0t2.gpu_nvlink_aggregate_throughput_bytes_per_second == 230e9
+    assert _nvlink_raw(
+        DCGM_FI_PROF_NVLINK_TX_BYTES=110e9,
+        DCGM_FI_PROF_NVLINK_RX_BYTES=120e9,
+    ) == 230e9
 
 
 def test_nvlink_aggregate_field_takes_precedence_over_profile_fields():

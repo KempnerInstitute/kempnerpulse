@@ -34,10 +34,9 @@ def test_na_becomes_none_never_zero():
 
 def test_nvlink_profile_fields_are_parsed():
     records = parse_dmon_block(_load())
-    warm_gpu0 = records[2]
-    assert warm_gpu0.fields["DCGM_FI_DEV_NVLINK_BANDWIDTH_TOTAL"] is None
-    assert warm_gpu0.fields["DCGM_FI_PROF_NVLINK_TX_BYTES"] == 110000000000.0
-    assert warm_gpu0.fields["DCGM_FI_PROF_NVLINK_RX_BYTES"] == 120000000000.0
+    warm_gpu1 = records[3]
+    assert warm_gpu1.fields["DCGM_FI_PROF_NVLINK_TX_BYTES"] == 210000000000.0
+    assert warm_gpu1.fields["DCGM_FI_PROF_NVLINK_RX_BYTES"] == 220000000000.0
 
 
 def test_skips_headers_and_blank_lines():
